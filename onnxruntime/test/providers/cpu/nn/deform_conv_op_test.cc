@@ -70,7 +70,7 @@ void RunDeformConvTest(const DeformConvTestParams& params,
 
   test.AddOutput<float>("Y", Y_shape, expected_Y, false, rtol, atol);
 
-  std::unordered_set<std::string> excluded = {kTensorrtExecutionProvider, kCudaExecutionProvider,
+  std::unordered_set<std::string> excluded = {kTensorrtExecutionProvider,
                                                kOpenVINOExecutionProvider, kQnnExecutionProvider};
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", excluded);
 }
@@ -199,7 +199,7 @@ TEST(DeformConvTest, ForwardNoMask) {
   test.AddInput<float>("B", {p.n_out_channels}, B);
   test.AddOptionalInputEdge<float>();  // no mask
   test.AddOutput<float>("Y", Y_shape, expected_Y, false, 1e-4f, 1e-4f);
-  std::unordered_set<std::string> excluded = {kTensorrtExecutionProvider, kCudaExecutionProvider,
+  std::unordered_set<std::string> excluded = {kTensorrtExecutionProvider,
                                                kOpenVINOExecutionProvider, kQnnExecutionProvider};
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", excluded);
 }
@@ -245,7 +245,7 @@ TEST(DeformConvTest, EmptyBatch) {
   test.AddInput<float>("B", {p.n_out_channels}, B);
   test.AddOptionalInputEdge<float>();
   test.AddOutput<float>("Y", Y_shape, expected_Y);
-  std::unordered_set<std::string> excluded = {kTensorrtExecutionProvider, kCudaExecutionProvider,
+  std::unordered_set<std::string> excluded = {kTensorrtExecutionProvider,
                                                kOpenVINOExecutionProvider, kQnnExecutionProvider};
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", excluded);
 }
