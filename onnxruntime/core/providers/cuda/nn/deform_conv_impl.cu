@@ -13,7 +13,6 @@ namespace cuda {
 namespace {
 
 constexpr int kDeformConvThreadsPerBlock = 256;
-constexpr int kMaxParallelImgs = 32;
 
 // Bilinear interpolation at (h, w). Returns 0 if out of bounds (ONNX spec).
 template <typename T>
@@ -129,20 +128,9 @@ __global__ void DeformConvAddBiasKernel(T* Y, const T* B, int64_t N, int64_t M, 
   int64_t out_size = out_h * out_w;
   int64_t total = N * M * out_size;
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
-    int64_t n = idx / (M * out_size);
     int64_t m = (idx / out_size) % M;
-    int64_t i = idx % out_size;
     Y[idx] += B[m];
   }
-}
-
-template <typename T>
-void DeformConvAddBiasImpl(cudaStream_t stream, T* Y, const T* B, int64_t N, int64_t M, int64_t out_h, int64_t out_w) {
-  int64_t total = N * M * out_h * out_w;
-  if (total <= 0) return;
-  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
-  blocks = std::min(blocks, 65535);
-  DeformConvAddBiasKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(Y, B, N, M, out_h, out_w);
 }
 
 // Transpose row-major [rows, cols] to column-major: dst[i+j*rows] = src[i*cols+j].
@@ -154,15 +142,6 @@ __global__ void TransposeRowMajorToColMajorKernel(const T* __restrict__ src, T* 
     int64_t j = idx % cols;
     dst[i + j * rows] = src[i * cols + j];
   }
-}
-
-template <typename T>
-void DeformConvTransposeRowMajorToColMajor(cudaStream_t stream, const T* row_major_src, T* col_major_dst, int64_t rows, int64_t cols) {
-  int64_t total = rows * cols;
-  if (total <= 0) return;
-  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
-  blocks = std::min(blocks, 65535);
-  TransposeRowMajorToColMajorKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(row_major_src, col_major_dst, rows, cols);
 }
 
 // Copy column-major [rows, cols] to row-major: dst[i*cols+j] = src[i+j*rows].
@@ -177,6 +156,24 @@ __global__ void CopyColMajorToRowMajorKernel(const T* __restrict__ src, T* __res
 }
 
 }  // namespace
+
+template <typename T>
+void DeformConvAddBiasImpl(cudaStream_t stream, T* Y, const T* B, int64_t N, int64_t M, int64_t out_h, int64_t out_w) {
+  int64_t total = N * M * out_h * out_w;
+  if (total <= 0) return;
+  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
+  blocks = std::min(blocks, 65535);
+  DeformConvAddBiasKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(Y, B, N, M, out_h, out_w);
+}
+
+template <typename T>
+void DeformConvTransposeRowMajorToColMajor(cudaStream_t stream, const T* row_major_src, T* col_major_dst, int64_t rows, int64_t cols) {
+  int64_t total = rows * cols;
+  if (total <= 0) return;
+  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
+  blocks = std::min(blocks, 65535);
+  TransposeRowMajorToColMajorKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(row_major_src, col_major_dst, rows, cols);
+}
 
 template <typename T>
 void DeformConvCopyColMajorToRowMajor(cudaStream_t stream, const T* col_major_src, T* row_major_dst, int64_t rows, int64_t cols) {
@@ -272,7 +269,7 @@ void DeformConvIm2ColImpl(
 }
 
 #define INST_DeformConvIm2ColImpl(T) \
-  template void DeformConvIm2ColImpl<T>(cudaStream_t, const T*, const T*, const T*, T*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool);
+  template void DeformConvIm2ColImpl<T>(cudaStream_t, const T*, const T*, const T*, T*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool);
 
 INST_DeformConvIm2ColImpl(float)
 INST_DeformConvIm2ColImpl(double)

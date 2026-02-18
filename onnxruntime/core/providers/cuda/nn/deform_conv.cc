@@ -3,11 +3,11 @@
 //
 // CUDA implementation of DeformConv (deformable convolution 2D).
 
+#include "core/providers/shared_library/provider_api.h"
 #include "deform_conv.h"
 #include "deform_conv_impl.h"
 
 #include "core/common/narrow.h"
-#include "core/common/safeint.h"
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/shared_inc/fpgeneric.h"
 
@@ -165,7 +165,7 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
       // Correct: C = A^T * B with A = [kernel_dim, M/group], B = [kernel_dim, col_stride]. So A^T*B = [M/group, col_stride].
       // Pass A = W_g (row-major [M/group, kernel_dim]), transa = T -> cuBLAS reads A as lda x k = (M/group) x kernel_dim col-major, so A^T = kernel_dim x (M/group). Good.
       // B = col_transposed (column-major [kernel_dim, col_stride]), transb = N. So C = A^T * B = [M/group, col_stride].
-      CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
+      CUBLAS_RETURN_IF_ERROR((cublasGemmHelper(
           cublas,
           CUBLAS_OP_T,
           CUBLAS_OP_N,
@@ -181,7 +181,7 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
           reinterpret_cast<CudaT*>(gemm_output_buffer.get()),
           narrow<int>(M / group),
           device_prop,
-          UseTF32()));
+          UseTF32())));
 
       DeformConvCopyColMajorToRowMajor<T>(
           stream,
