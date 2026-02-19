@@ -4,12 +4,12 @@
 #pragma once
 
 #include <stdint.h>
-#include "core/providers/cuda/shared_inc/cuda_utils.h"
 
 namespace onnxruntime {
 namespace cuda {
 
 // Adds bias to output: Y[n,m,oh,ow] += B[m]. Y is [N, M, out_h, out_w], B is [M].
+// T may be float, double, MLFloat16 (FP16), or BFloat16.
 template <typename T>
 void DeformConvAddBiasImpl(
     cudaStream_t stream,
@@ -21,6 +21,7 @@ void DeformConvAddBiasImpl(
     int64_t out_w);
 
 // Copies GEMM output (row-major [M_per_group, cur_parallel*output_image_size]) to NCHW slice at Y_g.
+// T may be float, double, MLFloat16 (FP16), or BFloat16.
 template <typename T>
 void DeformConvCopyGemmOutputRowMajorToNCHW(
     cudaStream_t stream,
@@ -32,7 +33,7 @@ void DeformConvCopyGemmOutputRowMajorToNCHW(
     int64_t cur_parallel);
 
 // Fills col_buffer with deformable im2col. col_buffer layout: row-major [C*kH*kW, parallel_imgs*out_h*out_w].
-// Called once per batch block; caller does GEMM and bias.
+// Called once per batch block; caller does GEMM and bias. T may be float, double, MLFloat16 (FP16), or BFloat16.
 template <typename T>
 void DeformConvIm2ColImpl(
     cudaStream_t stream,

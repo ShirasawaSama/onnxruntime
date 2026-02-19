@@ -248,6 +248,8 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
 
 REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(double)
+REGISTER_KERNEL_TYPED(MLFloat16)
+REGISTER_KERNEL_TYPED(BFloat16)
 
 }  // namespace cuda
 }  // namespace onnxruntime
