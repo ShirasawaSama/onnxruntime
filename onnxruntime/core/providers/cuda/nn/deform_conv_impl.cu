@@ -9,6 +9,8 @@
 #include "core/providers/cuda/shared_inc/fast_divmod.h"
 #include "core/common/float16.h"
 #include <type_traits>
+#include <algorithm>
+#include <limits>
 
 namespace onnxruntime {
 namespace cuda {
@@ -16,6 +18,13 @@ namespace cuda {
 namespace {
 
 constexpr int kDeformConvThreadsPerBlock = 256;
+
+// Calculate grid size with a safety limit to prevent overflow.
+// Since we use grid-stride loops in kernels, limiting the grid size is safe.
+inline int GetGridSize(size_t n, size_t threads_per_block) {
+  size_t blocks_needed = (n + threads_per_block - 1) / threads_per_block;
+  return static_cast<int>(std::min(blocks_needed, static_cast<size_t>(std::numeric_limits<int>::max())));
+}
 
 // Bilinear interpolation at (h, w). Returns 0 if out of bounds (ONNX spec).
 template <typename T>
@@ -252,7 +261,7 @@ template <typename T>
 void DeformConvAddBiasImpl(cudaStream_t stream, T* Y, const T* B, int64_t N, int64_t M, int64_t out_h, int64_t out_w) {
   int64_t total = N * M * out_h * out_w;
   if (total <= 0) return;
-  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
+  int blocks = GetGridSize(static_cast<size_t>(total), kDeformConvThreadsPerBlock);
   DeformConvAddBiasKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(Y, B, N, M, out_h, out_w);
 }
 
@@ -267,7 +276,7 @@ void DeformConvCopyGemmOutputRowMajorToNCHW(
     int64_t cur_parallel) {
   int64_t total = cur_parallel * M_per_group * output_image_size;
   if (total <= 0) return;
-  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
+  int blocks = GetGridSize(static_cast<size_t>(total), kDeformConvThreadsPerBlock);
   CopyGemmOutputRowMajorToNCHWKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
       gemm_output, Y_g, M, M_per_group, output_image_size, cur_parallel);
 }
@@ -304,7 +313,7 @@ void DeformConvIm2ColImpl(
   const bool use_64bit = (num_kernels > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) ||
                         (col_numel > static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
 
-  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(num_kernels), kDeformConvThreadsPerBlock));
+  int blocks = GetGridSize(static_cast<size_t>(num_kernels), kDeformConvThreadsPerBlock);
 
   if (use_64bit) {
     DeformableIm2ColKernel<T, int64_t><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
