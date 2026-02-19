@@ -155,6 +155,26 @@ __global__ void CopyColMajorToRowMajorKernel(const T* __restrict__ src, T* __res
   }
 }
 
+// Copy GEMM output (column-major [M_per_group, cur_parallel*output_image_size]) into NCHW Y_g.
+// src(c, j) with j = b_idx*output_image_size + pos -> dst[b_idx*M*output_image_size + c*output_image_size + pos].
+template <typename T>
+__global__ void CopyGemmOutputToNCHWKernel(
+    const T* __restrict__ src,
+    T* __restrict__ dst,
+    int64_t M,
+    int64_t M_per_group,
+    int64_t output_image_size,
+    int64_t cur_parallel) {
+  int64_t total = cur_parallel * M_per_group * output_image_size;
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
+    int64_t pos = idx % output_image_size;
+    int64_t c = (idx / output_image_size) % M_per_group;
+    int64_t b_idx = idx / (output_image_size * M_per_group);
+    int64_t j = b_idx * output_image_size + pos;
+    dst[b_idx * M * output_image_size + c * output_image_size + pos] = src[c + j * M_per_group];
+  }
+}
+
 }  // namespace
 
 template <typename T>
@@ -182,6 +202,23 @@ void DeformConvCopyColMajorToRowMajor(cudaStream_t stream, const T* col_major_sr
   int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
   blocks = std::min(blocks, 65535);
   CopyColMajorToRowMajorKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(col_major_src, row_major_dst, rows, cols);
+}
+
+template <typename T>
+void DeformConvCopyGemmOutputToNCHW(
+    cudaStream_t stream,
+    const T* gemm_output,
+    T* Y_g,
+    int64_t M,
+    int64_t M_per_group,
+    int64_t output_image_size,
+    int64_t cur_parallel) {
+  int64_t total = cur_parallel * M_per_group * output_image_size;
+  if (total <= 0) return;
+  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
+  blocks = std::min(blocks, 65535);
+  CopyGemmOutputToNCHWKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
+      gemm_output, Y_g, M, M_per_group, output_image_size, cur_parallel);
 }
 
 template <typename T>
@@ -279,6 +316,9 @@ template void DeformConvTransposeRowMajorToColMajor<double>(cudaStream_t, const 
 
 template void DeformConvCopyColMajorToRowMajor<float>(cudaStream_t, const float*, float*, int64_t, int64_t);
 template void DeformConvCopyColMajorToRowMajor<double>(cudaStream_t, const double*, double*, int64_t, int64_t);
+
+template void DeformConvCopyGemmOutputToNCHW<float>(cudaStream_t, const float*, float*, int64_t, int64_t, int64_t, int64_t);
+template void DeformConvCopyGemmOutputToNCHW<double>(cudaStream_t, const double*, double*, int64_t, int64_t, int64_t, int64_t);
 
 template void DeformConvAddBiasImpl<float>(cudaStream_t, float*, const float*, int64_t, int64_t, int64_t, int64_t);
 template void DeformConvAddBiasImpl<double>(cudaStream_t, double*, const double*, int64_t, int64_t, int64_t, int64_t);

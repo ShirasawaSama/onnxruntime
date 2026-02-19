@@ -38,6 +38,17 @@ void DeformConvCopyColMajorToRowMajor(
     int64_t rows,
     int64_t cols);
 
+// Copies GEMM output (col-major [M_per_group, cur_parallel*output_image_size]) to NCHW slice at Y_g.
+template <typename T>
+void DeformConvCopyGemmOutputToNCHW(
+    cudaStream_t stream,
+    const T* gemm_output,
+    T* Y_g,
+    int64_t M,
+    int64_t M_per_group,
+    int64_t output_image_size,
+    int64_t cur_parallel);
+
 // Fills col_buffer with deformable im2col. col_buffer layout: row-major [C*kH*kW, parallel_imgs*out_h*out_w].
 // Called once per batch block; caller does GEMM and bias.
 template <typename T>

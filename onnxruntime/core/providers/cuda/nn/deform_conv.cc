@@ -165,6 +165,7 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
       // Correct: C = A^T * B with A = [kernel_dim, M/group], B = [kernel_dim, col_stride]. So A^T*B = [M/group, col_stride].
       // Pass A = W_g (row-major [M/group, kernel_dim]), transa = T -> cuBLAS reads A as lda x k = (M/group) x kernel_dim col-major, so A^T = kernel_dim x (M/group). Good.
       // B = col_transposed (column-major [kernel_dim, col_stride]), transb = N. So C = A^T * B = [M/group, col_stride].
+      // With transa=CUBLAS_OP_T, A is (kernel_dim x M/group) in column-major, so lda = kernel_dim.
       CUBLAS_RETURN_IF_ERROR((cublasGemmHelper(
           cublas,
           CUBLAS_OP_T,
@@ -174,7 +175,7 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
           narrow<int>(kernel_dim),
           &alpha,
           reinterpret_cast<const CudaT*>(W_g),
-          narrow<int>(M / group),
+          narrow<int>(kernel_dim),
           reinterpret_cast<const CudaT*>(col_transposed.get()),
           narrow<int>(kernel_dim),
           &beta,
@@ -183,12 +184,14 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
           device_prop,
           UseTF32())));
 
-      DeformConvCopyColMajorToRowMajor<T>(
+      DeformConvCopyGemmOutputToNCHW<T>(
           stream,
           gemm_output_buffer.get(),
           Y_g,
+          M,
           M / group,
-          cur_out_size);
+          output_image_size,
+          cur_parallel);
     }
   }
 
