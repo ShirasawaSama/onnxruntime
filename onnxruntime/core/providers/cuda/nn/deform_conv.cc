@@ -102,10 +102,9 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
   const int64_t col_buffer_size = (C * kernel_size) * col_stride;
 
   AllocatorPtr alloc;
-  const int64_t col_transposed_size = kernel_dim * col_stride;
   ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
   auto col_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>(col_buffer_size));
-  auto col_transposed = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>(col_transposed_size));
+  // Removed col_transposed allocation as we avoid physical transpose.
   auto gemm_output_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>((M / group) * col_stride));
 
   const T* Xdata = X->Data<T>();
@@ -157,34 +156,47 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
       const T* col_g = col_buffer.get() + g * kernel_dim * col_stride;
       T* Y_g = Ydata + b * M * output_image_size + g * (M / group) * output_image_size;
 
-      // Transpose col_g (row-major [kernel_dim, col_stride]) to column-major for cuBLAS.
-      DeformConvTransposeRowMajorToColMajor<T>(stream, col_g, col_transposed.get(), kernel_dim, col_stride);
+      // Avoid physical transpose by using cuBLAS OP_N/OP_N logic.
+      // We want Y = W * Col.
+      // W is [M/group, kernel_dim] (Row-Major).
+      // Col is [kernel_dim, cur_out_size] (Row-Major).
+      // We compute Y^T = Col^T * W^T.
+      // Col^T (Col-Major [cur_out_size, kernel_dim]) is exactly Col (Row-Major [kernel_dim, cur_out_size]) in memory.
+      // W^T (Col-Major [kernel_dim, M/group]) is exactly W (Row-Major [M/group, kernel_dim]) in memory.
+      // Result Y^T is Col-Major [cur_out_size, M/group].
+      // In memory, Y^T (Col-Major) is exactly Y (Row-Major [M/group, cur_out_size]).
+      // So we get Y in Row-Major layout.
 
-      // cuBLAS: C = alpha*op(A)*op(B) + beta*C, column-major. We want C = W * Col = [M/group, col_stride].
-      // op(A)=W [M/group, kernel_dim] -> pass A = W_g, transa = T, lda = M/group (A col-major (M/group)xkernel_dim, A^T = kernel_dim x (M/group)... no).
-      // Correct: C = A^T * B with A = [kernel_dim, M/group], B = [kernel_dim, col_stride]. So A^T*B = [M/group, col_stride].
-      // Pass A = W_g (row-major [M/group, kernel_dim]), transa = T -> cuBLAS reads A as lda x k = (M/group) x kernel_dim col-major, so A^T = kernel_dim x (M/group). Good.
-      // B = col_transposed (column-major [kernel_dim, col_stride]), transb = N. So C = A^T * B = [M/group, col_stride].
-      // With transa=CUBLAS_OP_T, A is (kernel_dim x M/group) in column-major, so lda = kernel_dim.
+      // A = Col (Row-Major [kernel_dim, cur_out_size]) -> interpreted as Col-Major [cur_out_size, kernel_dim].
+      // B = W (Row-Major [M/group, kernel_dim]) -> interpreted as Col-Major [kernel_dim, M/group].
+      // C = A * B = Col^T * W^T = Y^T.
+      // C is Col-Major [cur_out_size, M/group].
+      // m = cur_out_size, n = M/group, k = kernel_dim.
+      // lda = cur_out_size.
+      // ldb = kernel_dim.
+      // ldc = cur_out_size.
+
       CUBLAS_RETURN_IF_ERROR((cublasGemmHelper(
           cublas,
-          CUBLAS_OP_T,
           CUBLAS_OP_N,
-          narrow<int>(M / group),
+          CUBLAS_OP_N,
           narrow<int>(cur_out_size),
+          narrow<int>(M / group),
           narrow<int>(kernel_dim),
           &alpha,
+          reinterpret_cast<const CudaT*>(col_g),
+          narrow<int>(cur_out_size),
           reinterpret_cast<const CudaT*>(W_g),
-          narrow<int>(kernel_dim),
-          reinterpret_cast<const CudaT*>(col_transposed.get()),
           narrow<int>(kernel_dim),
           &beta,
           reinterpret_cast<CudaT*>(gemm_output_buffer.get()),
-          narrow<int>(M / group),
+          narrow<int>(cur_out_size),
           device_prop,
           UseTF32())));
 
-      DeformConvCopyGemmOutputToNCHW<T>(
+      // The output gemm_output_buffer is now Row-Major [M/group, cur_out_size].
+      // We need to copy it to Y_g (NCHW).
+      DeformConvCopyGemmOutputRowMajorToNCHW<T>(
           stream,
           gemm_output_buffer.get(),
           Y_g,

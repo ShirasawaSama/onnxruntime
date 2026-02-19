@@ -6,6 +6,7 @@
 
 #include "deform_conv_impl.h"
 #include "core/providers/cuda/cu_inc/common.cuh"
+#include "core/providers/cuda/shared_inc/fast_divmod.h"
 
 namespace onnxruntime {
 namespace cuda {
@@ -35,10 +36,10 @@ __device__ __inline__ T BilinearInterpolate(
   T hh = static_cast<T>(1) - lh;
   T hw = static_cast<T>(1) - lw;
 
-  T v1 = (h_low >= 0 && w_low >= 0) ? in[h_low * width + w_low] : static_cast<T>(0);
-  T v2 = (h_low >= 0 && w_high < width) ? in[h_low * width + w_high] : static_cast<T>(0);
-  T v3 = (h_high < height && w_low >= 0) ? in[h_high * width + w_low] : static_cast<T>(0);
-  T v4 = (h_high < height && w_high < width) ? in[h_high * width + w_high] : static_cast<T>(0);
+  T v1 = (h_low >= 0 && w_low >= 0) ? __ldg(in + h_low * width + w_low) : static_cast<T>(0);
+  T v2 = (h_low >= 0 && w_high < width) ? __ldg(in + h_low * width + w_high) : static_cast<T>(0);
+  T v3 = (h_high < height && w_low >= 0) ? __ldg(in + h_high * width + w_low) : static_cast<T>(0);
+  T v4 = (h_high < height && w_high < width) ? __ldg(in + h_high * width + w_high) : static_cast<T>(0);
 
   T w1 = hh * hw, w2 = hh * lw, w3 = lh * hw, w4 = lh * lw;
   return w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4;
@@ -66,22 +67,32 @@ __global__ void DeformableIm2ColKernel(
     int64_t dilation_w,
     int64_t channels,
     int64_t offset_group,
-    int64_t out_h,
-    int64_t out_w,
-    int64_t parallel_imgs,
+    DivMod<IndexT> out_h_div,
+    DivMod<IndexT> out_w_div,
+    DivMod<IndexT> parallel_imgs_div,
+    DivMod<IndexT> channel_per_offset_grp_div,
     bool use_mask,
     T* __restrict__ data_col) {
+  
+  // Reconstruct dimensions from DivMod objects
+  const int64_t out_h = out_h_div.d_;
+  const int64_t out_w = out_w_div.d_;
+  const int64_t parallel_imgs = parallel_imgs_div.d_;
+  
   const int64_t out_size = out_h * out_w;
   const int64_t col_stride = parallel_imgs * out_size;
-  const int64_t channel_per_offset_grp = channels / offset_group;
 
   for (IndexT index = blockIdx.x * blockDim.x + threadIdx.x; index < num_kernels; index += blockDim.x * gridDim.x) {
-    const int64_t out_x = index % out_w;
-    const int64_t out_y = (index / out_w) % out_h;
-    const int64_t out_b = (index / out_size) % parallel_imgs;
-    const int64_t in_c = index / (out_size * parallel_imgs);
+    IndexT val = index;
+    IndexT out_x, out_y, out_b, in_c;
+    
+    // Fast division/modulo to recover coordinates
+    out_w_div.divmod(val, val, out_x);
+    out_h_div.divmod(val, val, out_y);
+    parallel_imgs_div.divmod(val, in_c, out_b);
 
-    const int64_t offset_grp = in_c / channel_per_offset_grp;
+    IndexT offset_grp, dummy;
+    channel_per_offset_grp_div.divmod(in_c, offset_grp, dummy);
 
     const T* input_ptr = input + out_b * (channels * height * width) + in_c * (height * width);
     const T* offset_ptr = offset + out_b * (offset_group * 2 * weight_h * weight_w * out_size) +
@@ -99,13 +110,13 @@ __global__ void DeformableIm2ColKernel(
 
         T mask_val = static_cast<T>(1);
         if (use_mask) {
-          mask_val = mask_ptr[mask_idx * out_size + out_y * out_w + out_x];
+          mask_val = __ldg(mask_ptr + mask_idx * out_size + out_y * out_w + out_x);
         }
 
         const int64_t offset_h_idx = (offset_idx)*out_size + out_y * out_w + out_x;
         const int64_t offset_w_idx = (offset_idx + 1) * out_size + out_y * out_w + out_x;
-        const T offset_h = offset_ptr[offset_h_idx];
-        const T offset_w = offset_ptr[offset_w_idx];
+        const T offset_h = __ldg(offset_ptr + offset_h_idx);
+        const T offset_w = __ldg(offset_ptr + offset_w_idx);
 
         const T h_im = out_y * stride_h - pad_h + i * dilation_h + offset_h;
         const T w_im = out_x * stride_w - pad_w + j * dilation_w + offset_w;
@@ -129,36 +140,14 @@ __global__ void DeformConvAddBiasKernel(T* Y, const T* B, int64_t N, int64_t M, 
   int64_t total = N * M * out_size;
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
     int64_t m = (idx / out_size) % M;
-    Y[idx] += B[m];
+    Y[idx] += __ldg(B + m);
   }
 }
 
-// Transpose row-major [rows, cols] to column-major: dst[i+j*rows] = src[i*cols+j].
-template <typename T>
-__global__ void TransposeRowMajorToColMajorKernel(const T* __restrict__ src, T* __restrict__ dst, int64_t rows, int64_t cols) {
-  int64_t total = rows * cols;
-  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
-    int64_t i = idx / cols;
-    int64_t j = idx % cols;
-    dst[i + j * rows] = src[i * cols + j];
-  }
-}
-
-// Copy column-major [rows, cols] to row-major: dst[i*cols+j] = src[i+j*rows].
-template <typename T>
-__global__ void CopyColMajorToRowMajorKernel(const T* __restrict__ src, T* __restrict__ dst, int64_t rows, int64_t cols) {
-  int64_t total = rows * cols;
-  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
-    int64_t i = idx / cols;
-    int64_t j = idx % cols;
-    dst[i * cols + j] = src[i + j * rows];
-  }
-}
-
-// Copy GEMM output (column-major [M_per_group, cur_parallel*output_image_size]) into NCHW Y_g.
+// Copy GEMM output (row-major [M_per_group, cur_parallel*output_image_size]) into NCHW Y_g.
 // src(c, j) with j = b_idx*output_image_size + pos -> dst[b_idx*M*output_image_size + c*output_image_size + pos].
 template <typename T>
-__global__ void CopyGemmOutputToNCHWKernel(
+__global__ void CopyGemmOutputRowMajorToNCHWKernel(
     const T* __restrict__ src,
     T* __restrict__ dst,
     int64_t M,
@@ -171,7 +160,8 @@ __global__ void CopyGemmOutputToNCHWKernel(
     int64_t c = (idx / output_image_size) % M_per_group;
     int64_t b_idx = idx / (output_image_size * M_per_group);
     int64_t j = b_idx * output_image_size + pos;
-    dst[b_idx * M * output_image_size + c * output_image_size + pos] = src[c + j * M_per_group];
+    // src index for row-major: c * (cur_parallel * output_image_size) + j
+    dst[b_idx * M * output_image_size + c * output_image_size + pos] = src[c * (cur_parallel * output_image_size) + j];
   }
 }
 
@@ -182,30 +172,11 @@ void DeformConvAddBiasImpl(cudaStream_t stream, T* Y, const T* B, int64_t N, int
   int64_t total = N * M * out_h * out_w;
   if (total <= 0) return;
   int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
-  blocks = std::min(blocks, 65535);
   DeformConvAddBiasKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(Y, B, N, M, out_h, out_w);
 }
 
 template <typename T>
-void DeformConvTransposeRowMajorToColMajor(cudaStream_t stream, const T* row_major_src, T* col_major_dst, int64_t rows, int64_t cols) {
-  int64_t total = rows * cols;
-  if (total <= 0) return;
-  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
-  blocks = std::min(blocks, 65535);
-  TransposeRowMajorToColMajorKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(row_major_src, col_major_dst, rows, cols);
-}
-
-template <typename T>
-void DeformConvCopyColMajorToRowMajor(cudaStream_t stream, const T* col_major_src, T* row_major_dst, int64_t rows, int64_t cols) {
-  int64_t total = rows * cols;
-  if (total <= 0) return;
-  int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
-  blocks = std::min(blocks, 65535);
-  CopyColMajorToRowMajorKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(col_major_src, row_major_dst, rows, cols);
-}
-
-template <typename T>
-void DeformConvCopyGemmOutputToNCHW(
+void DeformConvCopyGemmOutputRowMajorToNCHW(
     cudaStream_t stream,
     const T* gemm_output,
     T* Y_g,
@@ -216,8 +187,7 @@ void DeformConvCopyGemmOutputToNCHW(
   int64_t total = cur_parallel * M_per_group * output_image_size;
   if (total <= 0) return;
   int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(total), kDeformConvThreadsPerBlock));
-  blocks = std::min(blocks, 65535);
-  CopyGemmOutputToNCHWKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
+  CopyGemmOutputRowMajorToNCHWKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
       gemm_output, Y_g, M, M_per_group, output_image_size, cur_parallel);
 }
 
@@ -254,7 +224,6 @@ void DeformConvIm2ColImpl(
                         (col_numel > static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
 
   int blocks = static_cast<int>(CeilDiv(static_cast<size_t>(num_kernels), kDeformConvThreadsPerBlock));
-  blocks = std::min(blocks, 65535);
 
   if (use_64bit) {
     DeformableIm2ColKernel<T, int64_t><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
@@ -272,11 +241,12 @@ void DeformConvIm2ColImpl(
         stride_w,
         dilation_h,
         dilation_w,
-        C,
+        C, // channels is C
         offset_group,
-        out_h,
-        out_w,
-        parallel_imgs,
+        DivMod<int64_t>(out_h),
+        DivMod<int64_t>(out_w),
+        DivMod<int64_t>(parallel_imgs),
+        DivMod<int64_t>(C / offset_group),
         use_mask,
         col_buffer);
   } else {
@@ -295,11 +265,12 @@ void DeformConvIm2ColImpl(
         stride_w,
         dilation_h,
         dilation_w,
-        C,
+        C, // channels is C
         offset_group,
-        out_h,
-        out_w,
-        parallel_imgs,
+        DivMod<int32_t>(static_cast<int32_t>(out_h)),
+        DivMod<int32_t>(static_cast<int32_t>(out_w)),
+        DivMod<int32_t>(static_cast<int32_t>(parallel_imgs)),
+        DivMod<int32_t>(static_cast<int32_t>(C / offset_group)),
         use_mask,
         col_buffer);
   }
@@ -311,14 +282,8 @@ void DeformConvIm2ColImpl(
 INST_DeformConvIm2ColImpl(float)
 INST_DeformConvIm2ColImpl(double)
 
-template void DeformConvTransposeRowMajorToColMajor<float>(cudaStream_t, const float*, float*, int64_t, int64_t);
-template void DeformConvTransposeRowMajorToColMajor<double>(cudaStream_t, const double*, double*, int64_t, int64_t);
-
-template void DeformConvCopyColMajorToRowMajor<float>(cudaStream_t, const float*, float*, int64_t, int64_t);
-template void DeformConvCopyColMajorToRowMajor<double>(cudaStream_t, const double*, double*, int64_t, int64_t);
-
-template void DeformConvCopyGemmOutputToNCHW<float>(cudaStream_t, const float*, float*, int64_t, int64_t, int64_t, int64_t);
-template void DeformConvCopyGemmOutputToNCHW<double>(cudaStream_t, const double*, double*, int64_t, int64_t, int64_t, int64_t);
+template void DeformConvCopyGemmOutputRowMajorToNCHW<float>(cudaStream_t, const float*, float*, int64_t, int64_t, int64_t, int64_t);
+template void DeformConvCopyGemmOutputRowMajorToNCHW<double>(cudaStream_t, const double*, double*, int64_t, int64_t, int64_t, int64_t);
 
 template void DeformConvAddBiasImpl<float>(cudaStream_t, float*, const float*, int64_t, int64_t, int64_t, int64_t);
 template void DeformConvAddBiasImpl<double>(cudaStream_t, double*, const double*, int64_t, int64_t, int64_t, int64_t);

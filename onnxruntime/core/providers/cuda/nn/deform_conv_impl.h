@@ -20,27 +20,9 @@ void DeformConvAddBiasImpl(
     int64_t out_h,
     int64_t out_w);
 
-// Transposes row-major [rows, cols] to column-major [rows, cols]: dst[i+j*rows] = src[i*cols+j].
+// Copies GEMM output (row-major [M_per_group, cur_parallel*output_image_size]) to NCHW slice at Y_g.
 template <typename T>
-void DeformConvTransposeRowMajorToColMajor(
-    cudaStream_t stream,
-    const T* row_major_src,
-    T* col_major_dst,
-    int64_t rows,
-    int64_t cols);
-
-// Copies from column-major [rows, cols] to row-major [rows, cols]. Used after GEMM.
-template <typename T>
-void DeformConvCopyColMajorToRowMajor(
-    cudaStream_t stream,
-    const T* col_major_src,
-    T* row_major_dst,
-    int64_t rows,
-    int64_t cols);
-
-// Copies GEMM output (col-major [M_per_group, cur_parallel*output_image_size]) to NCHW slice at Y_g.
-template <typename T>
-void DeformConvCopyGemmOutputToNCHW(
+void DeformConvCopyGemmOutputRowMajorToNCHW(
     cudaStream_t stream,
     const T* gemm_output,
     T* Y_g,
