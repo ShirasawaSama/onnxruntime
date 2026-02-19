@@ -97,7 +97,20 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
   const int64_t input_image_size = H * W_in;
   const int64_t kernel_dim = (C / group) * kernel_size;
 
-  const int n_parallel_imgs = GetGreatestDivisorBelowBound(static_cast<int>(N), kMaxParallelImgs);
+  // Calculate memory usage per image to avoid OOM with large images
+  // col_buffer: C * kernel_size * output_image_size
+  // gemm_output_buffer: (M / group) * output_image_size
+  // We use a safe max(1, ...) for bytes_per_image to avoid division by zero in edge cases
+  const size_t bytes_per_image = SafeInt<size_t>(output_image_size) * (C * kernel_size + M / group) * sizeof(T);
+
+  // Heuristic: limit temp memory to 256MB per chunk to balance parallelism and memory usage.
+  // For small images, this allows up to kMaxParallelImgs (32).
+  // For large images (4K/8K), this restricts parallelism to 1 to prevent OOM.
+  constexpr size_t kMaxTempMemSize = 256 * 1024 * 1024;
+  const int max_parallel_imgs_mem = std::max(1, static_cast<int>(kMaxTempMemSize / std::max(size_t(1), bytes_per_image)));
+  const int target_parallel_imgs = std::min(kMaxParallelImgs, max_parallel_imgs_mem);
+
+  const int n_parallel_imgs = GetGreatestDivisorBelowBound(static_cast<int>(N), target_parallel_imgs);
   const int64_t col_stride = static_cast<int64_t>(n_parallel_imgs) * output_image_size;
   const int64_t col_buffer_size = (C * kernel_size) * col_stride;
 
