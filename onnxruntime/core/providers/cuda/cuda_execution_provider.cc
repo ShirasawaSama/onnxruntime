@@ -386,6 +386,7 @@ std::optional<bool> CUDAExecutionProvider::ShouldConvertDataLayoutForOp([[maybe_
       "BatchNormalization",
       "Conv",
       "ConvTranspose",
+      "DeformConv",
       "GlobalMaxPool",
       "MaxPool",
       "GlobalAveragePool",

@@ -122,6 +122,8 @@ void OpSet_Internal_NHWC_ONNX::ForEachSchema(const std::function<void(ONNX_NAMES
   REGISTER_NHWC_SCHEMA(fn, GlobalLpPool, 2);
   REGISTER_NHWC_SCHEMA(fn, GlobalMaxPool, 1);
 
+  REGISTER_NHWC_SCHEMA(fn, DeformConv, 19);
+  REGISTER_NHWC_SCHEMA(fn, DeformConv, 22);
   REGISTER_NHWC_SCHEMA(fn, GridSample, 16);
   REGISTER_NHWC_SCHEMA(fn, GridSample, 20);
 

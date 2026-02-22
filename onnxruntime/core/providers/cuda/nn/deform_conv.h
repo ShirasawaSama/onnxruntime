@@ -11,7 +11,7 @@
 namespace onnxruntime {
 namespace cuda {
 
-template <typename T>
+template <typename T, bool NHWC = false>
 class DeformConv final : public CudaKernel {
  public:
   explicit DeformConv(const OpKernelInfo& info) : CudaKernel(info), attrs_(info) {}

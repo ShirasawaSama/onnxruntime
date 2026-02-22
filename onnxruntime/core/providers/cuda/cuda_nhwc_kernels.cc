@@ -86,6 +86,12 @@ class CUDA_NHWC_OP_VERSIONED_TYPED_CLASS_NAME(1, 12, MLFloat16, LRN);
 class CUDA_NHWC_OP_TYPED_CLASS_NAME(13, float, LRN);
 class CUDA_NHWC_OP_TYPED_CLASS_NAME(13, double, LRN);
 class CUDA_NHWC_OP_TYPED_CLASS_NAME(13, MLFloat16, LRN);
+class CUDA_NHWC_OP_VERSIONED_TYPED_CLASS_NAME(19, 21, float, DeformConv);
+class CUDA_NHWC_OP_VERSIONED_TYPED_CLASS_NAME(19, 21, MLFloat16, DeformConv);
+class CUDA_NHWC_OP_VERSIONED_TYPED_CLASS_NAME(19, 21, BFloat16, DeformConv);
+class CUDA_NHWC_OP_TYPED_CLASS_NAME(22, float, DeformConv);
+class CUDA_NHWC_OP_TYPED_CLASS_NAME(22, MLFloat16, DeformConv);
+class CUDA_NHWC_OP_TYPED_CLASS_NAME(22, BFloat16, DeformConv);
 
 Status RegisterCudaNhwcKernels(KernelRegistry& kernel_registry) {
   static const BuildKernelCreateInfoFn nhwc_function_table[] = {
@@ -149,6 +155,12 @@ Status RegisterCudaNhwcKernels(KernelRegistry& kernel_registry) {
       BuildKernelCreateInfo<CUDA_NHWC_OP_TYPED_CLASS_NAME(13, float, LRN)>,
       BuildKernelCreateInfo<CUDA_NHWC_OP_TYPED_CLASS_NAME(13, double, LRN)>,
       BuildKernelCreateInfo<CUDA_NHWC_OP_TYPED_CLASS_NAME(13, MLFloat16, LRN)>,
+      BuildKernelCreateInfo<CUDA_NHWC_OP_VERSIONED_TYPED_CLASS_NAME(19, 21, float, DeformConv)>,
+      BuildKernelCreateInfo<CUDA_NHWC_OP_VERSIONED_TYPED_CLASS_NAME(19, 21, MLFloat16, DeformConv)>,
+      BuildKernelCreateInfo<CUDA_NHWC_OP_VERSIONED_TYPED_CLASS_NAME(19, 21, BFloat16, DeformConv)>,
+      BuildKernelCreateInfo<CUDA_NHWC_OP_TYPED_CLASS_NAME(22, float, DeformConv)>,
+      BuildKernelCreateInfo<CUDA_NHWC_OP_TYPED_CLASS_NAME(22, MLFloat16, DeformConv)>,
+      BuildKernelCreateInfo<CUDA_NHWC_OP_TYPED_CLASS_NAME(22, BFloat16, DeformConv)>,
   };
 
   for (auto& function_table_entry : nhwc_function_table) {

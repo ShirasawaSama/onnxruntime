@@ -76,8 +76,8 @@ size_t GetDeformConvEffectiveMaxTempBytes() {
 
 }  // namespace
 
-template <typename T>
-Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
+template <typename T, bool NHWC>
+Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
   typedef typename ToCudaType<T>::MappedType CudaT;
 
   const auto* X = context->Input<Tensor>(0);
@@ -87,7 +87,7 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
   const auto* mask = context->Input<Tensor>(4);
 
   DeformConvParams params;
-  ORT_RETURN_IF_ERROR(DeformConvValidateAndParse(attrs_, X->Shape(), W->Shape(), offset->Shape(), mask ? &mask->Shape() : nullptr, params));
+  ORT_RETURN_IF_ERROR(DeformConvValidateAndParse(attrs_, X->Shape(), W->Shape(), offset->Shape(), mask ? &mask->Shape() : nullptr, params, NHWC));
 
   const int64_t N = params.N;
   const int64_t C = params.C;
@@ -108,17 +108,21 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
   const int64_t out_w = params.out_w;
   const bool use_mask = params.use_mask;
 
-  Tensor* Y = context->Output(0, {N, M, out_h, out_w});
+  Tensor* Y = nullptr;
+  if constexpr (NHWC) {
+    Y = context->Output(0, {N, out_h, out_w, M});
+  } else {
+    Y = context->Output(0, {N, M, out_h, out_w});
+  }
   if (Y->Shape().Size() == 0) {
     return Status::OK();
   }
 
   const int64_t kernel_size = kH * kW;
   const int64_t output_image_size = out_h * out_w;
-  const int64_t input_image_size = H * W_in;
+  const int64_t input_image_size = NHWC ? (H * W_in * C) : (C * H * W_in);
   const int64_t kernel_dim = (C / group) * kernel_size;
 
-  // col_buffer: C * kernel_size * output_image_size; gemm_output_buffer: (M/group) * output_image_size
   const size_t bytes_per_image = SafeInt<size_t>(output_image_size) * (C * kernel_size + M / group) * sizeof(T);
   const size_t effective_max_temp = GetDeformConvEffectiveMaxTempBytes();
   const int max_parallel_imgs_mem = std::max(1, static_cast<int>(effective_max_temp / std::max(size_t(1), bytes_per_image)));
@@ -131,7 +135,6 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
   AllocatorPtr alloc;
   ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
   auto col_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>(col_buffer_size));
-  // Removed col_transposed allocation as we avoid physical transpose.
   auto gemm_output_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>((M / group) * col_stride));
 
   const T* Xdata = X->Data<T>();
@@ -151,69 +154,81 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
     const int cur_parallel = static_cast<int>(std::min(static_cast<int64_t>(n_parallel_imgs), N - b));
     const int64_t cur_out_size = static_cast<int64_t>(cur_parallel) * output_image_size;
 
-    const T* X_block = Xdata + b * (C * input_image_size);
+    const T* X_block = Xdata + b * input_image_size;
     const T* offset_block = offset_data + b * (offset_group * 2 * kernel_size * output_image_size);
     const T* mask_block = use_mask ? (mask_data + b * (offset_group * kernel_size * output_image_size)) : nullptr;
 
-    ORT_RETURN_IF_ERROR(DeformConvIm2ColImpl<T>(
-        stream,
-        X_block,
-        offset_block,
-        mask_block,
-        col_buffer.get(),
-        cur_parallel,
-        C,
-        H,
-        W_in,
-        kH,
-        kW,
-        out_h,
-        out_w,
-        pad_h,
-        pad_w,
-        stride_h,
-        stride_w,
-        dilation_h,
-        dilation_w,
-        offset_group,
-        use_mask));
+    if constexpr (NHWC) {
+      ORT_RETURN_IF_ERROR(DeformConvIm2ColImplNHWC<T>(
+          stream,
+          X_block,
+          offset_block,
+          mask_block,
+          col_buffer.get(),
+          cur_parallel,
+          C,
+          H,
+          W_in,
+          kH,
+          kW,
+          out_h,
+          out_w,
+          pad_h,
+          pad_w,
+          stride_h,
+          stride_w,
+          dilation_h,
+          dilation_w,
+          offset_group,
+          use_mask));
+    } else {
+      ORT_RETURN_IF_ERROR(DeformConvIm2ColImpl<T>(
+          stream,
+          X_block,
+          offset_block,
+          mask_block,
+          col_buffer.get(),
+          cur_parallel,
+          C,
+          H,
+          W_in,
+          kH,
+          kW,
+          out_h,
+          out_w,
+          pad_h,
+          pad_w,
+          stride_h,
+          stride_w,
+          dilation_h,
+          dilation_w,
+          offset_group,
+          use_mask));
+    }
 
     for (int64_t g = 0; g < group; ++g) {
       const T* W_g = Wdata + g * (M / group) * kernel_dim;
       const T* col_g = col_buffer.get() + g * kernel_dim * col_stride;
-      T* Y_g = Ydata + b * M * output_image_size + g * (M / group) * output_image_size;
+      const int64_t m_per_group = M / group;
+      const int64_t channel_offset = g * m_per_group;
 
-      // Avoid physical transpose by using cuBLAS OP_N/OP_N logic.
-      // We want Y = W * Col.
-      // W is [M/group, kernel_dim] (Row-Major).
-      // Col is [kernel_dim, cur_out_size] (Row-Major).
-      // We compute Y^T = Col^T * W^T.
-      // Col^T (Col-Major [cur_out_size, kernel_dim]) is exactly Col (Row-Major [kernel_dim, cur_out_size]) in memory.
-      // W^T (Col-Major [kernel_dim, M/group]) is exactly W (Row-Major [M/group, kernel_dim]) in memory.
-      // Result Y^T is Col-Major [cur_out_size, M/group].
-      // In memory, Y^T (Col-Major) is exactly Y (Row-Major [M/group, cur_out_size]).
-      // So we get Y in Row-Major layout.
+      bool gemm_writes_directly = false;
+      T* gemm_dst = gemm_output_buffer.get();
 
-      // A = Col (Row-Major [kernel_dim, cur_out_size]) -> interpreted as Col-Major [cur_out_size, kernel_dim].
-      // B = W (Row-Major [M/group, kernel_dim]) -> interpreted as Col-Major [kernel_dim, M/group].
-      // C = A * B = Col^T * W^T = Y^T.
-      // C is Col-Major [cur_out_size, M/group].
-      // m = cur_out_size, n = M/group, k = kernel_dim.
-      // lda = cur_out_size.
-      // ldb = kernel_dim.
-      // ldc = cur_out_size.
-      //
-      // When cur_parallel == 1: cur_out_size == output_image_size, so C layout (pos, channel) matches
-      // NCHW Y_g[0, channel, pos] exactly. Write directly to Y_g and skip the copy kernel.
-      // When cur_parallel > 1: layouts differ, must copy via DeformConvCopyGemmOutputRowMajorToNCHW.
-      const bool gemm_writes_directly = (cur_parallel == 1);
+      if constexpr (!NHWC) {
+        T* Y_g = Ydata + b * M * output_image_size + channel_offset * output_image_size;
+        gemm_writes_directly = (cur_parallel == 1);
+        if (gemm_writes_directly) {
+          gemm_dst = Y_g;
+        }
+      }
 
       CUBLAS_RETURN_IF_ERROR((cublasGemmHelper(
           cublas,
           CUBLAS_OP_N,
           CUBLAS_OP_N,
           narrow<int>(cur_out_size),
-          narrow<int>(M / group),
+          narrow<int>(m_per_group),
           narrow<int>(kernel_dim),
           &alpha,
           reinterpret_cast<const CudaT*>(col_g),
@@ -221,18 +236,28 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
           reinterpret_cast<const CudaT*>(W_g),
           narrow<int>(kernel_dim),
           &beta,
-          (gemm_writes_directly ? reinterpret_cast<CudaT*>(Y_g) : reinterpret_cast<CudaT*>(gemm_output_buffer.get())),
+          reinterpret_cast<CudaT*>(gemm_dst),
           narrow<int>(gemm_writes_directly ? output_image_size : cur_out_size),
           device_prop,
           UseTF32())));
 
-      if (!gemm_writes_directly) {
+      if constexpr (NHWC) {
+        ORT_RETURN_IF_ERROR(DeformConvCopyGemmOutputRowMajorToNHWC<T>(
+            stream,
+            gemm_output_buffer.get(),
+            Ydata,
+            M,
+            m_per_group,
+            channel_offset,
+            output_image_size,
+            cur_parallel));
+      } else if (!gemm_writes_directly) {
         ORT_RETURN_IF_ERROR(DeformConvCopyGemmOutputRowMajorToNCHW<T>(
             stream,
             gemm_output_buffer.get(),
-            Y_g,
+            Ydata + b * M * output_image_size + channel_offset * output_image_size,
             M,
-            M / group,
+            m_per_group,
             output_image_size,
             cur_parallel));
       }
@@ -240,7 +265,11 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
   }
 
   if (Bdata != nullptr) {
-    ORT_RETURN_IF_ERROR(DeformConvAddBiasImpl<T>(stream, Ydata, Bdata, N, M, out_h, out_w));
+    if constexpr (NHWC) {
+      ORT_RETURN_IF_ERROR(DeformConvAddBiasImplNHWC<T>(stream, Ydata, Bdata, N, M, out_h, out_w));
+    } else {
+      ORT_RETURN_IF_ERROR(DeformConvAddBiasImpl<T>(stream, Ydata, Bdata, N, M, out_h, out_w));
+    }
   }
 
   return Status::OK();
@@ -255,7 +284,7 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
       T,                                                                                   \
       kCudaExecutionProvider,                                                              \
       (*KernelDefBuilder::Create()).TypeConstraint("T", DataTypeImpl::GetTensorType<T>()), \
-      DeformConv<T>);                                                                      \
+      DeformConv<T, false>);                                                               \
   ONNX_OPERATOR_TYPED_KERNEL_EX(                                                           \
       DeformConv,                                                                          \
       kOnnxDomain,                                                                         \
@@ -263,7 +292,7 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
       T,                                                                                   \
       kCudaExecutionProvider,                                                              \
       (*KernelDefBuilder::Create()).TypeConstraint("T", DataTypeImpl::GetTensorType<T>()), \
-      DeformConv<T>);
+      DeformConv<T, false>);
 
 REGISTER_DEFORMCONV_KERNEL_TYPED(float)
 REGISTER_DEFORMCONV_KERNEL_TYPED(double)
@@ -271,6 +300,33 @@ REGISTER_DEFORMCONV_KERNEL_TYPED(MLFloat16)
 REGISTER_DEFORMCONV_KERNEL_TYPED(BFloat16)
 
 #undef REGISTER_DEFORMCONV_KERNEL_TYPED
+
+#ifdef ENABLE_CUDA_NHWC_OPS
+#define REGISTER_DEFORMCONV_NHWC_KERNEL_TYPED(T)                                          \
+  ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(                                                 \
+      DeformConv,                                                                          \
+      kMSInternalNHWCDomain,                                                                \
+      19,                                                                                  \
+      21,                                                                                  \
+      T,                                                                                   \
+      kCudaExecutionProvider,                                                              \
+      (*KernelDefBuilder::Create()).TypeConstraint("T", DataTypeImpl::GetTensorType<T>()), \
+      DeformConv<T, true>);                                                                 \
+  ONNX_OPERATOR_TYPED_KERNEL_EX(                                                           \
+      DeformConv,                                                                          \
+      kMSInternalNHWCDomain,                                                                \
+      22,                                                                                  \
+      T,                                                                                   \
+      kCudaExecutionProvider,                                                              \
+      (*KernelDefBuilder::Create()).TypeConstraint("T", DataTypeImpl::GetTensorType<T>()), \
+      DeformConv<T, true>);
+
+REGISTER_DEFORMCONV_NHWC_KERNEL_TYPED(float)
+REGISTER_DEFORMCONV_NHWC_KERNEL_TYPED(MLFloat16)
+REGISTER_DEFORMCONV_NHWC_KERNEL_TYPED(BFloat16)
+
+#undef REGISTER_DEFORMCONV_NHWC_KERNEL_TYPED
+#endif
 
 }  // namespace cuda
 }  // namespace onnxruntime

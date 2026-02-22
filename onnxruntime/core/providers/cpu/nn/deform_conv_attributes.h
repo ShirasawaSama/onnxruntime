@@ -72,18 +72,27 @@ struct DeformConvParams {
 
 // Validates inputs and parses attributes into params.
 // Returns Status::OK() on success; on failure, params may be partially filled.
+// When input_nhwc is true, X_shape is [N, H, W, C] (NHWC); otherwise [N, C, H, W] (NCHW).
 inline Status DeformConvValidateAndParse(
     const DeformConvAttributes& attrs,
     const TensorShape& X_shape,
     const TensorShape& W_shape,
     const TensorShape& offset_shape,
     const TensorShape* mask_shape,
-    DeformConvParams& params) {
+    DeformConvParams& params,
+    bool input_nhwc = false) {
   // Parse input shapes
-  params.N = X_shape[0];
-  params.C = X_shape[1];
-  params.H = X_shape[2];
-  params.W_in = X_shape[3];
+  if (input_nhwc) {
+    params.N = X_shape[0];
+    params.H = X_shape[1];
+    params.W_in = X_shape[2];
+    params.C = X_shape[3];
+  } else {
+    params.N = X_shape[0];
+    params.C = X_shape[1];
+    params.H = X_shape[2];
+    params.W_in = X_shape[3];
+  }
   params.M = W_shape[0];
 
   // Handle kernel shape inference

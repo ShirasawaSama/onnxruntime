@@ -3309,7 +3309,7 @@ const std::unordered_set<std::string_view>& GetLayoutSensitiveOps() {
       "BatchNormalization", "InstanceNormalization",
 
       // convolutions
-      "Conv", "ConvInteger", "QLinearConv", "ConvTranspose",
+      "Conv", "ConvInteger", "QLinearConv", "ConvTranspose", "DeformConv",
 
       // pooling
       "AveragePool", "LpPool", "MaxPool", "MaxUnpool",
