@@ -783,8 +783,8 @@ namespace Dml
                 // a legitimate case reaches here and DML needs to support a new input/output type
                 // besides tensors, then remove the assert.
 
-                // If the model has nodes that use Optional we will arrive here. It's a valid ONNX model but 
-                // TryGetTensorDataType doesn't handle Optional.              
+                // If the model has nodes that use Optional we will arrive here. It's a valid ONNX model but
+                // TryGetTensorDataType doesn't handle Optional.
                 // assert(false);
                 nodeContainsSupportedDataTypes = false;
                 return;
