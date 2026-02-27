@@ -721,10 +721,11 @@ namespace Dml
 
     bool IsCustomOpShader(const onnxruntime::Node& node)
     {
-        auto custom_ops = std::array<const char*, 3>{
+        auto custom_ops = std::array<const char*, 4>{
             "DFT",
             "STFT",
-            "GridSample"
+            "GridSample",
+            "DeformConv"
         };
 
         for (auto& custom_op : custom_ops)

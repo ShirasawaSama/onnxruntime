@@ -5,6 +5,7 @@
 #include "DmlDFT.h"
 #include "DmlSTFT.h"
 #include "DmlGridSample.h"
+#include "DmlDeformConv.h"
 #include "OperatorRegistration.h"
 #include "core/providers/dml/OperatorAuthorHelper/MLOperatorAuthorHelper.h"
 #include "core/providers/dml/OperatorAuthorHelper/OperatorVersions.h"
@@ -1347,6 +1348,7 @@ void RegisterDmlOperators(IMLOperatorRegistry* registry)
     GpuDFTOperatorFactory::RegisterDFTKernel(registry, 20);
     DmlSTFTOperatorFactory::RegisterSTFTKernel(registry);
     DmlGridSampleOperatorFactory::RegisterGridSampleKernel(registry);
+    DmlDeformConvOperatorFactory::RegisterDeformConvKernel(registry);
 }
 
 } // namespace Dml
