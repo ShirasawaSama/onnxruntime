@@ -59,7 +59,7 @@ Status DeformConvIm2ColImpl(
     int64_t offset_group,
     bool use_mask);
 
-// NHWC variant: input is [parallel_imgs, H, W, C], col_buffer layout unchanged.
+// NHWC variant: input is [parallel_imgs, H, W, C], col_buffer layout [C*kH*kW, col_stride] same as NCHW.
 template <typename T>
 Status DeformConvIm2ColImplNHWC(
     cudaStream_t stream,

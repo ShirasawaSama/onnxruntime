@@ -271,9 +271,7 @@ __global__ void DeformableIm2ColKernel(
     }
 
     // 5. Output pointer base calculation.
-    // data_col Layout: (C * KH * KW, N * OH * OW)
-    // The current thread writes to the column `c_col` = (b * OH * OW) + spatial_idx.
-    // The starting row for this channel is `in_c * KH * KW`.
+    // data_col Layout: [C*KH*KW, col_stride] row-major, matches Batched GEMM. Same for NCHW and NHWC.
     const int64_t c_col = static_cast<int64_t>(out_b) * out_size + spatial_idx;
     T* data_col_ptr_base = data_col + (static_cast<int64_t>(in_c) * h_dim * w_dim) * col_stride + c_col;
 
@@ -561,7 +559,6 @@ Status DeformConvIm2ColImplNHWC(
       stream, input, offset, mask, col_buffer, parallel_imgs, C, H, W, kH, kW,
       out_h, out_w, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, offset_group, use_mask);
 }
-
 
 template <typename T>
 Status DeformConvCopyGemmOutputRowMajorToNHWC(

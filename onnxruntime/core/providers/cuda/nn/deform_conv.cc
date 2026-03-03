@@ -135,7 +135,6 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
   AllocatorPtr alloc;
   ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
   auto col_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>(col_buffer_size));
-  auto gemm_output_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>((M / group) * col_stride));
 
   const T* Xdata = X->Data<T>();
   const T* Wdata = W->Data<T>();
@@ -146,6 +145,7 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
 
   cudaStream_t stream = Stream(context);
   cublasHandle_t cublas = GetCublasHandle(context);
+  cublasSetStream(cublas, stream);
   const cudaDeviceProp& device_prop = GetDeviceProp();
   CudaT alpha = ToCudaType<T>::FromFloat(1.0f);
   CudaT beta = ToCudaType<T>::FromFloat(0.0f);
@@ -206,47 +206,53 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
           use_mask));
     }
 
-    for (int64_t g = 0; g < group; ++g) {
-      const T* W_g = Wdata + g * (M / group) * kernel_dim;
-      const T* col_g = col_buffer.get() + g * kernel_dim * col_stride;
-      const int64_t m_per_group = M / group;
-      const int64_t channel_offset = g * m_per_group;
+    const int64_t m_per_group = M / group;
 
-      bool gemm_writes_directly = false;
-      T* gemm_dst = gemm_output_buffer.get();
+    if constexpr (NHWC) {
+      // --- NHWC: 单次 Batched GEMM 替代 group 次单独 GEMM，显著减少 kernel 启动开销 ---
+      // col_buffer layout: [C*kH*kW, col_stride] 行主序，每组 g 的 col 在 col_buffer + g*kernel_dim*col_stride
+      // Weight 每组: Wdata + g*m_per_group*kernel_dim
+      // 输出: Ydata + b*output_image_size*M + g*m_per_group (NHWC: [N,H,W,M])
+      // C = W * col: (m_per_group, cur_out_size)，需 CUBLAS_OP_T 传入 col^T 因 col 为行主序 [kernel_dim, col_stride]
+      CUBLAS_RETURN_IF_ERROR(cublasGemmStridedBatchedHelper(
+          cublas,
+          CUBLAS_OP_T,   // TransA: Weight [kernel_dim, m_per_group]
+          CUBLAS_OP_T,   // TransB: col 行主序 [kernel_dim, col_stride]，传 col^T 则 ldb=col_stride
+          narrow<int>(m_per_group),
+          narrow<int>(cur_out_size),
+          narrow<int>(kernel_dim),
+          &alpha,
+          reinterpret_cast<const CudaT*>(Wdata),
+          narrow<int>(kernel_dim),
+          narrow<int64_t>(m_per_group * kernel_dim),  // strideA
+          reinterpret_cast<const CudaT*>(col_buffer.get()),
+          narrow<int>(col_stride),  // ldb: col^T 的 leading dimension
+          narrow<int64_t>(kernel_dim * col_stride),   // strideB
+          &beta,
+          reinterpret_cast<CudaT*>(Ydata + b * output_image_size * M),
+          narrow<int>(M),
+          narrow<int64_t>(m_per_group),  // strideC: 每组写入 m_per_group 个通道
+          narrow<int>(group),
+          device_prop,
+          UseTF32()));
+    } else {
+      for (int64_t g = 0; g < group; ++g) {
+        const T* W_g = Wdata + g * m_per_group * kernel_dim;
+        const T* col_g = col_buffer.get() + g * kernel_dim * col_stride;
+        const int64_t channel_offset = g * m_per_group;
 
-      if constexpr (NHWC) {
-        // C = W * col (m_per_group, cur_out_size). With ldc=M, C(c,pos) at c+pos*M = NHWC layout.
-        gemm_dst = Ydata + b * output_image_size * M + channel_offset;
-        gemm_writes_directly = true;
-      } else {
+        bool gemm_writes_directly = false;
+
+        // NHWC: Batched GEMM writes directly to Y; NCHW: may need gemm_output_buffer when cur_parallel>1
+        auto gemm_output_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>((M / group) * col_stride));
+        T* gemm_dst = gemm_output_buffer.get();
+
         T* Y_g = Ydata + b * M * output_image_size + channel_offset * output_image_size;
         gemm_writes_directly = (cur_parallel == 1);
         if (gemm_writes_directly) {
           gemm_dst = Y_g;
         }
-      }
 
-      if constexpr (NHWC) {
-        // GEMM: C = W * col -> (m_per_group, cur_out_size), ldc=M for direct NHWC write
-        CUBLAS_RETURN_IF_ERROR((cublasGemmHelper(
-            cublas,
-            CUBLAS_OP_T,
-            CUBLAS_OP_T,
-            narrow<int>(m_per_group),
-            narrow<int>(cur_out_size),
-            narrow<int>(kernel_dim),
-            &alpha,
-            reinterpret_cast<const CudaT*>(W_g),
-            narrow<int>(kernel_dim),
-            reinterpret_cast<const CudaT*>(col_g),
-            narrow<int>(col_stride),
-            &beta,
-            reinterpret_cast<CudaT*>(gemm_dst),
-            narrow<int>(M),
-            device_prop,
-            UseTF32())));
-      } else {
         // GEMM: C = col^T * W^T -> (cur_out_size, m_per_group)
         CUBLAS_RETURN_IF_ERROR((cublasGemmHelper(
             cublas,
@@ -265,9 +271,7 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
             narrow<int>(gemm_writes_directly ? output_image_size : cur_out_size),
             device_prop,
             UseTF32())));
-      }
 
-      if constexpr (!NHWC) {
         if (!gemm_writes_directly) {
           ORT_RETURN_IF_ERROR(DeformConvCopyGemmOutputRowMajorToNCHW<T>(
               stream,
