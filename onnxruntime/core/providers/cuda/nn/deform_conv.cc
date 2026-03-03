@@ -215,7 +215,11 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
       bool gemm_writes_directly = false;
       T* gemm_dst = gemm_output_buffer.get();
 
-      if constexpr (!NHWC) {
+      if constexpr (NHWC) {
+        // C = W * col (m_per_group, cur_out_size). With ldc=M, C(c,pos) at c+pos*M = NHWC layout.
+        gemm_dst = Ydata + b * output_image_size * M + channel_offset;
+        gemm_writes_directly = true;
+      } else {
         T* Y_g = Ydata + b * M * output_image_size + channel_offset * output_image_size;
         gemm_writes_directly = (cur_parallel == 1);
         if (gemm_writes_directly) {
@@ -223,43 +227,57 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
         }
       }
 
-      CUBLAS_RETURN_IF_ERROR((cublasGemmHelper(
-          cublas,
-          CUBLAS_OP_N,
-          CUBLAS_OP_N,
-          narrow<int>(cur_out_size),
-          narrow<int>(m_per_group),
-          narrow<int>(kernel_dim),
-          &alpha,
-          reinterpret_cast<const CudaT*>(col_g),
-          narrow<int>(cur_out_size),
-          reinterpret_cast<const CudaT*>(W_g),
-          narrow<int>(kernel_dim),
-          &beta,
-          reinterpret_cast<CudaT*>(gemm_dst),
-          narrow<int>(gemm_writes_directly ? output_image_size : cur_out_size),
-          device_prop,
-          UseTF32())));
-
       if constexpr (NHWC) {
-        ORT_RETURN_IF_ERROR(DeformConvCopyGemmOutputRowMajorToNHWC<T>(
-            stream,
-            gemm_output_buffer.get(),
-            Ydata,
-            M,
-            m_per_group,
-            channel_offset,
-            output_image_size,
-            cur_parallel));
-      } else if (!gemm_writes_directly) {
-        ORT_RETURN_IF_ERROR(DeformConvCopyGemmOutputRowMajorToNCHW<T>(
-            stream,
-            gemm_output_buffer.get(),
-            Ydata + b * M * output_image_size + channel_offset * output_image_size,
-            M,
-            m_per_group,
-            output_image_size,
-            cur_parallel));
+        // GEMM: C = W * col -> (m_per_group, cur_out_size), ldc=M for direct NHWC write
+        CUBLAS_RETURN_IF_ERROR((cublasGemmHelper(
+            cublas,
+            CUBLAS_OP_T,
+            CUBLAS_OP_T,
+            narrow<int>(m_per_group),
+            narrow<int>(cur_out_size),
+            narrow<int>(kernel_dim),
+            &alpha,
+            reinterpret_cast<const CudaT*>(W_g),
+            narrow<int>(kernel_dim),
+            reinterpret_cast<const CudaT*>(col_g),
+            narrow<int>(col_stride),
+            &beta,
+            reinterpret_cast<CudaT*>(gemm_dst),
+            narrow<int>(M),
+            device_prop,
+            UseTF32())));
+      } else {
+        // GEMM: C = col^T * W^T -> (cur_out_size, m_per_group)
+        CUBLAS_RETURN_IF_ERROR((cublasGemmHelper(
+            cublas,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            narrow<int>(cur_out_size),
+            narrow<int>(m_per_group),
+            narrow<int>(kernel_dim),
+            &alpha,
+            reinterpret_cast<const CudaT*>(col_g),
+            narrow<int>(cur_out_size),
+            reinterpret_cast<const CudaT*>(W_g),
+            narrow<int>(kernel_dim),
+            &beta,
+            reinterpret_cast<CudaT*>(gemm_dst),
+            narrow<int>(gemm_writes_directly ? output_image_size : cur_out_size),
+            device_prop,
+            UseTF32())));
+      }
+
+      if constexpr (!NHWC) {
+        if (!gemm_writes_directly) {
+          ORT_RETURN_IF_ERROR(DeformConvCopyGemmOutputRowMajorToNCHW<T>(
+              stream,
+              gemm_output_buffer.get(),
+              Ydata + b * M * output_image_size + channel_offset * output_image_size,
+              M,
+              m_per_group,
+              output_image_size,
+              cur_parallel));
+        }
       }
     }
   }

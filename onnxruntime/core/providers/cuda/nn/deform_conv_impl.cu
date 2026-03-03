@@ -136,6 +136,8 @@ __device__ __inline__ BFloat16 BilinearInterpolate(
 }
 
 // Bilinear interpolation for NHWC input [H, W, C]. Samples at (h, w) for channel channel_idx.
+// For coalesced access: when threads process same (h,w) with consecutive channel_idx, the 4 loads
+// hit consecutive addresses (channels are contiguous at each spatial position).
 template <typename T>
 __device__ __inline__ T BilinearInterpolateNHWC(
     const T* in_base,
@@ -158,11 +160,16 @@ __device__ __inline__ T BilinearInterpolateNHWC(
   float hh = 1.0f - lh;
   float hw = 1.0f - lw;
 
-  int64_t stride = channels;
-  float v1 = (h_low >= 0 && w_low >= 0) ? static_cast<float>(DeformConvLdg(in_base + ((h_low * width + w_low) * stride + channel_idx))) : 0.0f;
-  float v2 = (h_low >= 0 && w_high < width) ? static_cast<float>(DeformConvLdg(in_base + ((h_low * width + w_high) * stride + channel_idx))) : 0.0f;
-  float v3 = (h_high < height && w_low >= 0) ? static_cast<float>(DeformConvLdg(in_base + ((h_high * width + w_low) * stride + channel_idx))) : 0.0f;
-  float v4 = (h_high < height && w_high < width) ? static_cast<float>(DeformConvLdg(in_base + ((h_high * width + w_high) * stride + channel_idx))) : 0.0f;
+  // NHWC: base addr for each spatial pos is (h*width+w)*channels; channel c is at +channel_idx
+  const int64_t stride = channels;
+  const int64_t p0 = (h_low * width + w_low) * stride + channel_idx;
+  const int64_t p1 = (h_low * width + w_high) * stride + channel_idx;
+  const int64_t p2 = (h_high * width + w_low) * stride + channel_idx;
+  const int64_t p3 = (h_high * width + w_high) * stride + channel_idx;
+  float v1 = (h_low >= 0 && w_low >= 0) ? static_cast<float>(DeformConvLdg(in_base + p0)) : 0.0f;
+  float v2 = (h_low >= 0 && w_high < width) ? static_cast<float>(DeformConvLdg(in_base + p1)) : 0.0f;
+  float v3 = (h_high < height && w_low >= 0) ? static_cast<float>(DeformConvLdg(in_base + p2)) : 0.0f;
+  float v4 = (h_high < height && w_high < width) ? static_cast<float>(DeformConvLdg(in_base + p3)) : 0.0f;
 
   float w1 = hh * hw, w2 = hh * lw, w3 = lh * hw, w4 = lh * lw;
   return static_cast<T>(w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4);
@@ -192,6 +199,7 @@ __global__ void DeformableIm2ColKernel(
     DivMod<IndexT> out_w_div,
     DivMod<IndexT> parallel_imgs_div,
     DivMod<IndexT> channel_per_offset_grp_div,
+    DivMod<IndexT> channel_div,  // For NHWC: channel varies fastest; divisor C for coalesced access
     bool use_mask,
     T* __restrict__ data_col) {
   constexpr bool is_fixed = (kH >= 0 && kW >= 0);
@@ -213,10 +221,18 @@ __global__ void DeformableIm2ColKernel(
     IndexT val = index;
     IndexT out_x, out_y, out_b, in_c;
 
-    // Fast division/modulo to recover coordinates
-    out_w_div.divmod(val, val, out_x);
-    out_h_div.divmod(val, val, out_y);
-    parallel_imgs_div.divmod(val, in_c, out_b);
+    // For NHWC: channel varies fastest so threads in a warp load consecutive channels at same (h,w)
+    // for coalesced bilinear interpolation. Index order: in_c + C*(out_x + out_w*(out_y + out_h*out_b))
+    if constexpr (IsNHWC) {
+      IndexT spatial_idx;
+      channel_div.divmod(val, spatial_idx, in_c);  // spatial_idx=val/C, in_c=val%C
+      out_w_div.divmod(spatial_idx, spatial_idx, out_x);
+      out_h_div.divmod(spatial_idx, out_b, out_y);  // out_b=spatial/out_h, out_y=spatial%out_h
+    } else {
+      out_w_div.divmod(val, val, out_x);
+      out_h_div.divmod(val, val, out_y);
+      parallel_imgs_div.divmod(val, in_c, out_b);
+    }
 
     // [Optimization 3] Avoid expensive division if offset_group is 1 (very common case).
     IndexT offset_grp = 0;
@@ -346,6 +362,8 @@ __global__ void DeformConvAddBiasKernel(
 }
 
 // Copy GEMM output. IsNHWC: dst layout differs. channel_offset only used when IsNHWC.
+// For NHWC: index order (b_idx, pos, c) with c fastest so consecutive threads write consecutive
+// channels at same spatial pos = coalesced writes. src layout: (M_per_group, cur_parallel*output_image_size).
 template <typename T, bool IsNHWC>
 __global__ void CopyGemmOutputToLayoutKernel(
     const T* __restrict__ src,
@@ -358,9 +376,17 @@ __global__ void CopyGemmOutputToLayoutKernel(
   int64_t total = cur_parallel * M_per_group * output_image_size;
   int64_t src_stride = cur_parallel * output_image_size;
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
-    int64_t pos = idx % output_image_size;
-    int64_t c = (idx / output_image_size) % M_per_group;
-    int64_t b_idx = idx / (output_image_size * M_per_group);
+    int64_t b_idx, pos, c;
+    if constexpr (IsNHWC) {
+      c = idx % M_per_group;
+      int64_t spatial_idx = idx / M_per_group;
+      pos = spatial_idx % output_image_size;
+      b_idx = spatial_idx / output_image_size;
+    } else {
+      pos = idx % output_image_size;
+      c = (idx / output_image_size) % M_per_group;
+      b_idx = idx / (output_image_size * M_per_group);
+    }
     int64_t j = b_idx * output_image_size + pos;
     T v = src[c * src_stride + j];
     if constexpr (IsNHWC) {
@@ -454,7 +480,9 @@ Status DeformConvIm2ColImplLayout(
           num_kernels, input, offset, mask, H, W, kH, kW, pad_h, pad_w,
           stride_h, stride_w, dilation_h, dilation_w, C, offset_group,
           DivMod<int64_t>(out_h), DivMod<int64_t>(out_w), DivMod<int64_t>(parallel_imgs),
-          DivMod<int64_t>(C / offset_group), use_mask, col_buffer);
+          DivMod<int64_t>(C / offset_group),
+          DivMod<int64_t>(static_cast<int64_t>(C)),
+          use_mask, col_buffer);
     } else {
       DeformableIm2ColKernel<T, int32_t, IsNHWC, KH, KW><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
           static_cast<int32_t>(num_kernels), input, offset, mask, H, W, kH, kW, pad_h, pad_w,
@@ -463,6 +491,7 @@ Status DeformConvIm2ColImplLayout(
           DivMod<int32_t>(static_cast<int32_t>(out_w)),
           DivMod<int32_t>(static_cast<int32_t>(parallel_imgs)),
           DivMod<int32_t>(static_cast<int32_t>(C / offset_group)),
+          DivMod<int32_t>(static_cast<int32_t>(C)),
           use_mask, col_buffer);
     }
   };
