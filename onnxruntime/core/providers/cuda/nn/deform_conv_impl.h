@@ -59,7 +59,19 @@ Status DeformConvIm2ColImpl(
     int64_t offset_group,
     bool use_mask);
 
-// NHWC variant: input is [parallel_imgs, H, W, C], col_buffer layout [C*kH*kW, col_stride] same as NCHW.
+// Reorders col from [L, C, kH*kW] to Batched GEMM format. Used after NHWC Im2Col (coalesced layout).
+template <typename T>
+Status DeformConvColReorderLxCKToBatched(
+    cudaStream_t stream,
+    const T* src,
+    T* dst,
+    int64_t cur_out_size,
+    int64_t C,
+    int64_t kernel_size,
+    int64_t kernel_dim,
+    int64_t group);
+
+// NHWC variant: input [parallel_imgs, H, W, C], col_buffer layout [L, C, kH*kW] (coalesced), then reorder for GEMM.
 template <typename T>
 Status DeformConvIm2ColImplNHWC(
     cudaStream_t stream,

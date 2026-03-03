@@ -135,6 +135,10 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
   AllocatorPtr alloc;
   ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
   auto col_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>(col_buffer_size));
+  decltype(col_buffer) col_reorder_buffer;
+  if constexpr (NHWC) {
+    col_reorder_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>(col_buffer_size));
+  }
 
   const T* Xdata = X->Data<T>();
   const T* Wdata = W->Data<T>();
@@ -181,6 +185,15 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
           dilation_w,
           offset_group,
           use_mask));
+      ORT_RETURN_IF_ERROR(DeformConvColReorderLxCKToBatched<T>(
+          stream,
+          col_buffer.get(),
+          col_reorder_buffer.get(),
+          cur_out_size,
+          C,
+          kernel_size,
+          kernel_dim,
+          group));
     } else {
       ORT_RETURN_IF_ERROR(DeformConvIm2ColImpl<T>(
           stream,
@@ -209,15 +222,11 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
     const int64_t m_per_group = M / group;
 
     if constexpr (NHWC) {
-      // --- NHWC: 单次 Batched GEMM 替代 group 次单独 GEMM，显著减少 kernel 启动开销 ---
-      // col_buffer layout: [C*kH*kW, col_stride] 行主序，每组 g 的 col 在 col_buffer + g*kernel_dim*col_stride
-      // Weight 每组: Wdata + g*m_per_group*kernel_dim
-      // 输出: Ydata + b*output_image_size*M + g*m_per_group (NHWC: [N,H,W,M])
-      // C = W * col: (m_per_group, cur_out_size)，需 CUBLAS_OP_T 传入 col^T 因 col 为行主序 [kernel_dim, col_stride]
+      // --- NHWC: Im2Col 写入 [L,C,k] 合并布局，Reorder 转 Batched GEMM 格式，单次 Batched GEMM ---
       CUBLAS_RETURN_IF_ERROR(cublasGemmStridedBatchedHelper(
           cublas,
           CUBLAS_OP_T,   // TransA: Weight [kernel_dim, m_per_group]
-          CUBLAS_OP_T,   // TransB: col 行主序 [kernel_dim, col_stride]，传 col^T 则 ldb=col_stride
+          CUBLAS_OP_T,   // TransB: col_reorder [kernel_dim, cur_out_size]
           narrow<int>(m_per_group),
           narrow<int>(cur_out_size),
           narrow<int>(kernel_dim),
@@ -225,9 +234,9 @@ Status DeformConv<T, NHWC>::ComputeInternal(OpKernelContext* context) const {
           reinterpret_cast<const CudaT*>(Wdata),
           narrow<int>(kernel_dim),
           narrow<int64_t>(m_per_group * kernel_dim),  // strideA
-          reinterpret_cast<const CudaT*>(col_buffer.get()),
-          narrow<int>(col_stride),  // ldb: col^T 的 leading dimension
-          narrow<int64_t>(kernel_dim * col_stride),   // strideB
+          reinterpret_cast<const CudaT*>(col_reorder_buffer.get()),
+          narrow<int>(cur_out_size),  // ldb: col^T [cur_out_size, kernel_dim]
+          narrow<int64_t>(kernel_dim * cur_out_size),   // strideB
           &beta,
           reinterpret_cast<CudaT*>(Ydata + b * output_image_size * M),
           narrow<int>(M),

@@ -209,11 +209,8 @@ __global__ void DeformableIm2ColKernel(
   // Reconstruct dimensions from DivMod objects
   const int64_t out_h = out_h_div.d_;
   const int64_t out_w = out_w_div.d_;
-  const int64_t parallel_imgs = parallel_imgs_div.d_;
 
   const int64_t out_size = out_h * out_w;
-  // The stride for data_col is (parallel_imgs * out_h * out_w)
-  const int64_t col_stride = parallel_imgs * out_size;
 
   using CoordT = typename std::conditional<DeformConvUseFloatCoords<T>::value, float, T>::type;
 
@@ -271,9 +268,21 @@ __global__ void DeformableIm2ColKernel(
     }
 
     // 5. Output pointer base calculation.
-    // data_col Layout: [C*KH*KW, col_stride] row-major, matches Batched GEMM. Same for NCHW and NHWC.
     const int64_t c_col = static_cast<int64_t>(out_b) * out_size + spatial_idx;
-    T* data_col_ptr_base = data_col + (static_cast<int64_t>(in_c) * h_dim * w_dim) * col_stride + c_col;
+    T* data_col_ptr_base;
+    int64_t write_stride;
+    if constexpr (IsNHWC) {
+      // [L, C, kH×kW] layout: coalesced writes (stride=1), then reorder for Batched GEMM
+      const int64_t kernel_dim = h_dim * w_dim;
+      data_col_ptr_base = data_col + c_col * (channels * kernel_dim) + static_cast<int64_t>(in_c) * kernel_dim;
+      write_stride = 1;
+    } else {
+      // [C*KH*KW, col_stride] row-major, matches Batched GEMM directly
+      const int64_t parallel_imgs = parallel_imgs_div.d_;
+      const int64_t col_stride = parallel_imgs * out_size;
+      data_col_ptr_base = data_col + (static_cast<int64_t>(in_c) * h_dim * w_dim) * col_stride + c_col;
+      write_stride = col_stride;
+    }
 
     // 6. Pre-calculate invariant coordinate parts.
     // Use float for coordinate math when T is half or BFloat16 to avoid precision loss.
@@ -291,7 +300,7 @@ __global__ void DeformableIm2ColKernel(
         // If mask is 0, the contribution is 0. Skip expensive offset load and interpolation.
         // Note: casting to float for comparison is safe for standard floating point types.
         if (static_cast<float>(mask_val) == 0.0f) {
-          data_col_ptr_base[kernel_idx * col_stride] = static_cast<T>(0);
+          data_col_ptr_base[kernel_idx * write_stride] = static_cast<T>(0);
           return;
         }
       }
@@ -315,7 +324,7 @@ __global__ void DeformableIm2ColKernel(
       }
 
       // Write result to data_col using pre-calculated base.
-      data_col_ptr_base[kernel_idx * col_stride] = val * mask_val;
+      data_col_ptr_base[kernel_idx * write_stride] = val * mask_val;
     };
 
     if constexpr (is_fixed) {
@@ -356,6 +365,28 @@ __global__ void DeformConvAddBiasKernel(
       div2.divmod(batch_channel_idx, batch_idx, channel_idx);
     }
     Y[idx] += DeformConvLdg(B + channel_idx);
+  }
+}
+
+// Reorder col from [L, C, kH*kW] (NHWC coalesced layout) to Batched GEMM format.
+// Input:  src[l, c, k] at src + l*(C*kernel_size) + c*kernel_size + k
+// Output: per-group column-major [cur_out_size, kernel_dim]; group g at dst + g*(cur_out_size*kernel_dim).
+template <typename T>
+__global__ void DeformConvColReorderLxCKToBatchedKernel(
+    const T* __restrict__ src,
+    T* __restrict__ dst,
+    int64_t cur_out_size,
+    int64_t C,
+    int64_t kernel_size,
+    int64_t kernel_dim,
+    int64_t group) {
+  const int64_t total = cur_out_size * C * kernel_size;
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += blockDim.x * gridDim.x) {
+    int64_t g = idx / (cur_out_size * kernel_dim);
+    int64_t rest = idx % (cur_out_size * kernel_dim);
+    int64_t l = rest % cur_out_size;
+    int64_t k = rest / cur_out_size;
+    dst[idx] = DeformConvLdg(src + l * (C * kernel_size) + g * kernel_dim + k);
   }
 }
 
@@ -561,6 +592,24 @@ Status DeformConvIm2ColImplNHWC(
 }
 
 template <typename T>
+Status DeformConvColReorderLxCKToBatched(
+    cudaStream_t stream,
+    const T* src,
+    T* dst,
+    int64_t cur_out_size,
+    int64_t C,
+    int64_t kernel_size,
+    int64_t kernel_dim,
+    int64_t group) {
+  const int64_t total = cur_out_size * C * kernel_size;
+  if (total <= 0) return Status::OK();
+  int blocks = GetGridSize(static_cast<size_t>(total), kDeformConvThreadsPerBlock);
+  DeformConvColReorderLxCKToBatchedKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
+      src, dst, cur_out_size, C, kernel_size, kernel_dim, group);
+  return CUDA_CALL(cudaGetLastError());
+}
+
+template <typename T>
 Status DeformConvCopyGemmOutputRowMajorToNHWC(
     cudaStream_t stream,
     const T* gemm_output,
@@ -598,6 +647,11 @@ INST_DeformConvIm2ColImplNHWC(float)
 INST_DeformConvIm2ColImplNHWC(double)
 INST_DeformConvIm2ColImplNHWC(half)
 INST_DeformConvIm2ColImplNHWC(BFloat16)
+
+template Status DeformConvColReorderLxCKToBatched<float>(cudaStream_t, const float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t);
+template Status DeformConvColReorderLxCKToBatched<double>(cudaStream_t, const double*, double*, int64_t, int64_t, int64_t, int64_t, int64_t);
+template Status DeformConvColReorderLxCKToBatched<half>(cudaStream_t, const half*, half*, int64_t, int64_t, int64_t, int64_t, int64_t);
+template Status DeformConvColReorderLxCKToBatched<BFloat16>(cudaStream_t, const BFloat16*, BFloat16*, int64_t, int64_t, int64_t, int64_t, int64_t);
 
 template Status DeformConvCopyGemmOutputRowMajorToNHWC<float>(cudaStream_t, const float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t);
 template Status DeformConvCopyGemmOutputRowMajorToNHWC<double>(cudaStream_t, const double*, double*, int64_t, int64_t, int64_t, int64_t, int64_t);
@@ -645,6 +699,14 @@ template Status DeformConvAddBiasImpl<BFloat16>(cudaStream_t, BFloat16*, const B
                                             parallel_imgs, C, H, W, kH, kW, out_h, out_w,                           \
                                             pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,               \
                                             offset_group, use_mask);                                                \
+  }                                                                                                                 \
+  template <>                                                                                                       \
+  Status DeformConvColReorderLxCKToBatched<ORT_T>(cudaStream_t stream, const ORT_T* src, ORT_T* dst,                \
+                                                  int64_t cur_out_size, int64_t C, int64_t kernel_size,            \
+                                                  int64_t kernel_dim, int64_t group) {                             \
+    return DeformConvColReorderLxCKToBatched<CUDA_T>(stream, reinterpret_cast<const CUDA_T*>(src),                 \
+                                                     reinterpret_cast<CUDA_T*>(dst),                                \
+                                                     cur_out_size, C, kernel_size, kernel_dim, group);             \
   }                                                                                                                 \
   template <>                                                                                                       \
   Status DeformConvCopyGemmOutputRowMajorToNCHW<ORT_T>(cudaStream_t stream,                                         \
