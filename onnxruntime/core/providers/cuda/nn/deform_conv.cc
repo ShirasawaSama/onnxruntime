@@ -118,7 +118,26 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
   const int64_t input_image_size = H * W_in;
   const int64_t kernel_dim = (C / group) * kernel_size;
 
-  // col_buffer: C * kernel_size * output_image_size; gemm_output_buffer: (M/group) * output_image_size
+  const T* Xdata = X->Data<T>();
+  const T* Wdata = W->Data<T>();
+  const T* offset_data = offset->Data<T>();
+  const T* mask_data = use_mask ? mask->Data<T>() : nullptr;
+  T* Ydata = Y->MutableData<T>();
+  const T* Bdata = (B != nullptr) ? B->Data<T>() : nullptr;
+
+  cudaStream_t stream = Stream(context);
+
+  // Fast path: fused 1x1 kernel. Eliminates col_buffer, im2col, GEMM, and copy. Max performance.
+  if (kH == 1 && kW == 1) {
+    int device_id = 0;
+    ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetDevice(&device_id)));
+    int max_smem = 0;
+    ORT_RETURN_IF_ERROR(CUDA_CALL(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, device_id)));
+    return DeformConvFused1x1Impl<T>(stream, params, Xdata, offset_data, mask_data, Wdata, Bdata, Ydata,
+                                    static_cast<size_t>(max_smem));
+  }
+
+  // Standard path: im2col + GEMM for kernel sizes > 1x1
   const size_t bytes_per_image = SafeInt<size_t>(output_image_size) * (C * kernel_size + M / group) * sizeof(T);
   const size_t effective_max_temp = GetDeformConvEffectiveMaxTempBytes();
   const int max_parallel_imgs_mem = std::max(1, static_cast<int>(effective_max_temp / std::max(size_t(1), bytes_per_image)));
@@ -131,17 +150,8 @@ Status DeformConv<T>::ComputeInternal(OpKernelContext* context) const {
   AllocatorPtr alloc;
   ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&alloc));
   auto col_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>(col_buffer_size));
-  // Removed col_transposed allocation as we avoid physical transpose.
   auto gemm_output_buffer = IAllocator::MakeUniquePtr<T>(alloc, SafeInt<size_t>((M / group) * col_stride));
 
-  const T* Xdata = X->Data<T>();
-  const T* Wdata = W->Data<T>();
-  const T* offset_data = offset->Data<T>();
-  const T* mask_data = use_mask ? mask->Data<T>() : nullptr;
-  T* Ydata = Y->MutableData<T>();
-  const T* Bdata = (B != nullptr) ? B->Data<T>() : nullptr;
-
-  cudaStream_t stream = Stream(context);
   cublasHandle_t cublas = GetCublasHandle(context);
   const cudaDeviceProp& device_prop = GetDeviceProp();
   CudaT alpha = ToCudaType<T>::FromFloat(1.0f);

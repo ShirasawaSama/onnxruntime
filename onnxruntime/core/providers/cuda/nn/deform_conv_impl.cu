@@ -8,6 +8,7 @@
 #include "core/providers/cuda/cu_inc/common.cuh"
 #include "core/providers/cuda/shared_inc/fast_divmod.h"
 #include "core/common/float16.h"
+#include <cstdint>
 #include <type_traits>
 #include <algorithm>
 #include <limits>
@@ -59,6 +60,30 @@ __device__ __inline__ T BilinearInterpolate(
 
   T w1 = hh * hw, w2 = hh * lw, w3 = lh * hw, w4 = lh * lw;
   return w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4;
+}
+
+// Coalesced bilinear for SharedKernel Phase 1: one warp loads for one channel.
+// 32 threads load 32 consecutive elements from rows h_low and h_high (coalesced).
+// Lane 0 has (h_low,w_low),(h_low,w_high); lane 1 has (h_high,w_low),(h_high,w_high). Lane 0 computes and broadcasts.
+template <typename T>
+__device__ __inline__ T BilinearInterpolateWarpCoalesced(
+    const T* ch_in, int64_t height, int64_t width,
+    int h_low, int w_low, float lh, float lw) {
+  const int h_high = h_low + 1;
+  const float hh = 1.0f - lh, hw = 1.0f - lw;
+  const int lane = static_cast<int>(threadIdx.x % GPU_WARP_SIZE);
+  float v_row0 = 0.0f, v_row1 = 0.0f;
+  if (w_low + lane < width) {
+    if (h_low >= 0) v_row0 = static_cast<float>(DeformConvLdg(ch_in + h_low * width + w_low + lane));
+    if (h_high < height) v_row1 = static_cast<float>(DeformConvLdg(ch_in + h_high * width + w_low + lane));
+  }
+  const float v1 = v_row0;
+  const float v2 = WARP_SHFL(v_row0, 1);
+  const float v3 = v_row1;
+  const float v4 = WARP_SHFL(v_row1, 1);
+  float r = (lane == 0) ? (hh * hw * v1 + hh * lw * v2 + lh * hw * v3 + lh * lw * v4) : 0.0f;
+  r = WARP_SHFL(r, 0);
+  return static_cast<T>(r);
 }
 
 // FP16/BF16: coordinate and weight math in float to avoid precision loss.
@@ -305,6 +330,283 @@ __global__ void DeformConvAddBiasKernel(
   }
 }
 
+constexpr int64_t kDeformConv1x1MaxSharedC = 4096;
+
+// WriteOutput: ONLY place that adds bias. dot_result must NOT include bias.
+template <typename T>
+__device__ __forceinline__ void DeformConv1x1WriteOutput(
+    T* output, int64_t b, int64_t m, int64_t spatial_idx, int64_t M, int64_t out_size,
+    T dot_result, const T* bias) {
+  output[b * M * out_size + m * out_size + spatial_idx] =
+      bias != nullptr ? dot_result + DeformConvLdg(bias + m) : dot_result;
+}
+
+template <typename T>
+__device__ __forceinline__ void DeformConv1x1WriteBiasOrZero(
+    T* output, int64_t b, int64_t m, int64_t spatial_idx, int64_t M, int64_t out_size, const T* bias) {
+  output[b * M * out_size + m * out_size + spatial_idx] =
+      bias != nullptr ? DeformConvLdg(bias + m) : static_cast<T>(0);
+}
+
+// Warp reduce for warp-tile: 32 threads sum to lane 0. Uses WARP_SHFL_DOWN.
+template <typename T>
+__device__ __forceinline__ T DeformConvWarpReduceSum(T val) {
+#pragma unroll
+  for (int offset = GPU_WARP_SIZE / 2; offset > 0; offset /= 2) {
+    val += WARP_SHFL_DOWN(val, offset);
+  }
+  return val;
+}
+
+constexpr int kDeformConv1x1WarpsPerBlock = 8;
+constexpr int kDeformConv1x1OutputsPerBlock = kDeformConv1x1WarpsPerBlock;
+
+static_assert(GPU_WARP_SIZE == 32, "DeformConv1x1SharedKernel assumes warp size 32");
+static_assert(kDeformConvThreadsPerBlock == kDeformConv1x1WarpsPerBlock * GPU_WARP_SIZE,
+              "block size must equal warps_per_block * warp_size");
+
+// 1x1 kernel with block-level shared sampling + warp-tile. Use when offset_group=1.
+// UseMask: compile-time, avoid runtime branch when mask is always 1.
+template <typename T, bool UseMask>
+__global__ void FusedDeformConv1x1SharedKernel(
+    const T* __restrict__ input,
+    const T* __restrict__ offset,
+    const T* __restrict__ mask,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ output,
+    int64_t N,
+    int64_t C,
+    int64_t H,
+    int64_t W,
+    int64_t M,
+    int64_t out_h,
+    int64_t out_w,
+    int64_t pad_h,
+    int64_t pad_w,
+    int64_t stride_h,
+    int64_t stride_w,
+    int64_t group,
+    int64_t K_positions) {
+  using CoordT = typename std::conditional<DeformConvUseFloatCoords<T>::value, float, T>::type;
+  const int64_t out_size = out_h * out_w;
+  const int64_t C_per_group = C / group;
+  const int64_t M_per_group = M / group;
+  extern __shared__ char smem_raw[];
+  T* smem = reinterpret_cast<T*>(smem_raw);
+
+  const int64_t m_blocks = (M + kDeformConv1x1OutputsPerBlock - 1) / kDeformConv1x1OutputsPerBlock;
+  const int64_t spatial_total = N * out_size;
+  const int64_t spatial_blocks = (spatial_total + K_positions - 1) / K_positions;
+  const int64_t block_row = blockIdx.x / m_blocks;
+  const int64_t m_block = blockIdx.x % m_blocks;
+  const int64_t m_start = m_block * kDeformConv1x1OutputsPerBlock;
+  const int64_t m_end = (m_start + kDeformConv1x1OutputsPerBlock < M) ? (m_start + kDeformConv1x1OutputsPerBlock) : M;
+  const int64_t num_outputs = m_end - m_start;
+
+  const int64_t spatial_start = block_row * K_positions;
+  const int64_t spatial_end = (spatial_start + K_positions < spatial_total) ? (spatial_start + K_positions) : spatial_total;
+  const int64_t K_actual = spatial_end - spatial_start;
+  const int64_t tasks_total = K_actual * num_outputs;
+
+  const int warp_idx = static_cast<int>(threadIdx.x / GPU_WARP_SIZE);
+  const int lane = static_cast<int>(threadIdx.x % GPU_WARP_SIZE);
+  using AccT = typename std::conditional<std::is_same<T, double>::value, double, float>::type;
+
+  // Phase 1: sample for all K positions. Early skip when mask==0 (sparse mask).
+  for (int64_t pos_idx = 0; pos_idx < K_actual; pos_idx++) {
+    const int64_t spatial_idx = spatial_start + pos_idx;
+    const int64_t b = spatial_idx / out_size;
+    const int64_t oh = (spatial_idx % out_size) / out_w;
+    const int64_t ow = spatial_idx % out_w;
+    const CoordT base_h = static_cast<CoordT>(oh * stride_h - pad_h);
+    const CoordT base_w = static_cast<CoordT>(ow * stride_w - pad_w);
+    const int64_t offset_base = b * 2 * out_size + spatial_idx;
+    const CoordT offset_h = static_cast<CoordT>(DeformConvLdg(offset + offset_base));
+    const CoordT offset_w = static_cast<CoordT>(DeformConvLdg(offset + offset_base + out_size));
+    const CoordT h_im = base_h + offset_h;
+    const CoordT w_im = base_w + offset_w;
+    T mask_val = UseMask ? DeformConvLdg(mask + b * out_size + spatial_idx) : static_cast<T>(1);
+    const bool mask_zero = UseMask && (static_cast<float>(mask_val) == 0.0f);
+
+    T* smem_pos = smem + pos_idx * C;
+    const int64_t chunk = kDeformConv1x1WarpsPerBlock * GPU_WARP_SIZE;
+    if (mask_zero) {
+      for (int64_t base = warp_idx * GPU_WARP_SIZE; base < C; base += chunk) {
+        const int n = static_cast<int>(std::min(static_cast<int64_t>(GPU_WARP_SIZE), C - base));
+        if (lane < n) smem_pos[base + lane] = static_cast<T>(0);
+      }
+    } else {
+      const int64_t input_batch_offset = b * C * H * W;
+      const T* in_base = input + input_batch_offset;
+      const float h_im_f = static_cast<float>(h_im), w_im_f = static_cast<float>(w_im);
+      const bool use_coalesced = (W >= 2 && h_im_f > -1.0f && h_im_f < static_cast<float>(H) &&
+                                  w_im_f > -1.0f && w_im_f < static_cast<float>(W));
+      const int h_low = static_cast<int>(floorf(h_im_f)), w_low = static_cast<int>(floorf(w_im_f));
+      const float lh = h_im_f - h_low, lw = w_im_f - w_low;
+      for (int64_t base = warp_idx * GPU_WARP_SIZE; base < C; base += chunk) {
+        T my_val = static_cast<T>(0);
+        const int n = static_cast<int>(std::min(static_cast<int64_t>(GPU_WARP_SIZE), C - base));
+#pragma unroll
+        for (int i = 0; i < GPU_WARP_SIZE; i++) {
+          if (i >= n) break;
+          const int64_t c = base + i;
+          T val = use_coalesced
+              ? (BilinearInterpolateWarpCoalesced(in_base + c * H * W, H, W, h_low, w_low, lh, lw) * mask_val)
+              : ((lane == 0) ? (BilinearInterpolate(in_base + c * H * W, H, W, h_im, w_im) * mask_val) : static_cast<T>(0));
+          if (!use_coalesced) val = WARP_SHFL(val, 0);
+          if (lane == i) my_val = val;
+        }
+        if (lane < n) smem_pos[base + lane] = my_val;
+      }
+    }
+  }
+  __syncthreads();
+
+  // Phase 2: each warp computes (pos, m) outputs
+  for (int64_t task = warp_idx; task < tasks_total; task += kDeformConv1x1WarpsPerBlock) {
+    const int64_t pos_idx = task / num_outputs;
+    const int64_t m_offset = task % num_outputs;
+    const int64_t spatial_idx = spatial_start + pos_idx;
+    const int64_t b = spatial_idx / out_size;
+    const int64_t m = m_start + m_offset;
+    const T* smem_pos = smem + pos_idx * C;
+
+    T mask_val = static_cast<T>(1);
+    if (UseMask) {
+      mask_val = DeformConvLdg(mask + b * out_size + spatial_idx);
+      if (static_cast<float>(mask_val) == 0.0f) {
+        if (lane == 0) DeformConv1x1WriteBiasOrZero(output, b, m, spatial_idx, M, out_size, bias);
+        continue;
+      }
+    }
+
+    const int64_t g = m / M_per_group;
+    const T* W_row = weight + (g * M_per_group + m % M_per_group) * C_per_group;
+    const T* smem_g = smem_pos + g * C_per_group;
+    AccT acc = static_cast<AccT>(0);
+    const bool w_aligned_f4 = (reinterpret_cast<uintptr_t>(W_row) & 15) == 0;
+    const bool s_aligned_f4 = (reinterpret_cast<uintptr_t>(smem_g) & 15) == 0;
+    const bool w_aligned_h2 = (reinterpret_cast<uintptr_t>(W_row) & 3) == 0;
+    const bool s_aligned_h2 = (reinterpret_cast<uintptr_t>(smem_g) & 3) == 0;
+    const bool c_div4 = (C_per_group & 3) == 0;
+    const bool c_div2 = (C_per_group & 1) == 0;
+    if (std::is_same<T, float>::value && w_aligned_f4 && s_aligned_f4 && c_div4) {
+      for (int64_t k = lane * 4; k < C_per_group; k += GPU_WARP_SIZE * 4) {
+        float4 w = *reinterpret_cast<const float4*>(W_row + k);
+        float4 s = *reinterpret_cast<const float4*>(smem_g + k);
+        acc += w.x * s.x + w.y * s.y + w.z * s.z + w.w * s.w;
+      }
+    } else if (std::is_same<T, half>::value && w_aligned_h2 && s_aligned_h2 && c_div2) {
+      for (int64_t k = lane * 2; k < C_per_group; k += GPU_WARP_SIZE * 2) {
+        half2 w = *reinterpret_cast<const half2*>(W_row + k);
+        half2 s = *reinterpret_cast<const half2*>(smem_g + k);
+        acc += __half2float(w.x) * __half2float(s.x) + __half2float(w.y) * __half2float(s.y);
+      }
+    } else {
+      for (int64_t k = 0; k < C_per_group; k += GPU_WARP_SIZE) {
+        const int64_t c = k + lane;
+        if (c < C_per_group) {
+          acc += static_cast<AccT>(DeformConvLdg(W_row + c)) * static_cast<AccT>(smem_g[c]);
+        }
+      }
+    }
+    acc = DeformConvWarpReduceSum(acc);
+    if (lane == 0) {
+      DeformConv1x1WriteOutput(output, b, m, spatial_idx, M, out_size, static_cast<T>(acc), bias);
+    }
+  }
+}
+
+// Fused 1x1 DeformConv: per-thread path. Optimizations: offset_group=1 hoists offset/mask.
+template <typename T>
+__global__ void FusedDeformConv1x1Kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ offset,
+    const T* __restrict__ mask,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ output,
+    int64_t N,
+    int64_t C,
+    int64_t H,
+    int64_t W,
+    int64_t M,
+    int64_t out_h,
+    int64_t out_w,
+    int64_t pad_h,
+    int64_t pad_w,
+    int64_t stride_h,
+    int64_t stride_w,
+    int64_t group,
+    int64_t offset_group,
+    bool use_mask) {
+  using CoordT = typename std::conditional<DeformConvUseFloatCoords<T>::value, float, T>::type;
+  const int64_t out_size = out_h * out_w;
+  const int64_t C_per_group = C / group;
+  const int64_t M_per_group = M / group;
+  const int64_t C_per_offset_grp = C / offset_group;
+
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < N * M * out_size; idx += blockDim.x * gridDim.x) {
+    int64_t val = idx;
+    const int64_t spatial_idx = val % out_size;
+    val /= out_size;
+    const int64_t m = val % M;
+    val /= M;
+    const int64_t b = val;
+    const int64_t oh = spatial_idx / out_w;
+    const int64_t ow = spatial_idx % out_w;
+
+    const int64_t g = m / M_per_group;
+    const int64_t m_local = m % M_per_group;
+    const CoordT base_h = static_cast<CoordT>(oh * stride_h - pad_h);
+    const CoordT base_w = static_cast<CoordT>(ow * stride_w - pad_w);
+
+    T acc = static_cast<T>(0);
+    const T* W_row = weight + (g * M_per_group + m_local) * C_per_group;
+    const int64_t input_batch_offset = b * C * H * W;
+
+    // offset_group=1: load once; else load per channel
+    CoordT h_im, w_im;
+    T mask_val = static_cast<T>(1);
+    if (offset_group == 1) {
+      const int64_t ob = b * 2 * out_size + spatial_idx;
+      h_im = base_h + static_cast<CoordT>(DeformConvLdg(offset + ob));
+      w_im = base_w + static_cast<CoordT>(DeformConvLdg(offset + ob + out_size));
+      if (use_mask) {
+        mask_val = DeformConvLdg(mask + b * out_size + spatial_idx);
+        if (static_cast<float>(mask_val) == 0.0f) {
+          DeformConv1x1WriteBiasOrZero(output, b, m, spatial_idx, M, out_size, bias);
+          continue;
+        }
+      }
+    }
+
+    for (int64_t c = 0; c < C_per_group; ++c) {
+      const int64_t c_global = g * C_per_group + c;
+      CoordT ch, cw;
+      T cm = static_cast<T>(1);
+      if (offset_group > 1) {
+        const int64_t og = c_global / C_per_offset_grp;
+        const int64_t ob = (b * offset_group + og) * 2 * out_size + spatial_idx;
+        ch = base_h + static_cast<CoordT>(DeformConvLdg(offset + ob));
+        cw = base_w + static_cast<CoordT>(DeformConvLdg(offset + ob + out_size));
+        if (use_mask) {
+          cm = DeformConvLdg(mask + (b * offset_group + og) * out_size + spatial_idx);
+          if (static_cast<float>(cm) == 0.0f) continue;
+        }
+      } else {
+        ch = h_im;
+        cw = w_im;
+        cm = mask_val;
+      }
+      T s = BilinearInterpolate(input + input_batch_offset + c_global * H * W, H, W, ch, cw);
+      acc += DeformConvLdg(W_row + c) * (s * cm);
+    }
+    DeformConv1x1WriteOutput(output, b, m, spatial_idx, M, out_size, acc, bias);
+  }
+}
+
 // Copy GEMM output (row-major [M_per_group, cur_parallel*output_image_size]) into NCHW Y_g.
 // src(c, j) with j = b_idx*output_image_size + pos -> dst[b_idx*M*output_image_size + c*output_image_size + pos].
 template <typename T>
@@ -366,6 +668,72 @@ Status DeformConvCopyGemmOutputRowMajorToNCHW(
   int blocks = GetGridSize(static_cast<size_t>(total), kDeformConvThreadsPerBlock);
   CopyGemmOutputRowMajorToNCHWKernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
       gemm_output, Y_g, M, M_per_group, output_image_size, cur_parallel);
+  return CUDA_CALL(cudaGetLastError());
+}
+
+template <typename T>
+Status DeformConvFused1x1Impl(
+    cudaStream_t stream,
+    const DeformConvParams& params,
+    const T* input,
+    const T* offset,
+    const T* mask,
+    const T* weight,
+    const T* bias,
+    T* output,
+    size_t max_smem_per_block) {
+  const int64_t total = params.N * params.M * params.out_h * params.out_w;
+  if (total <= 0) return Status::OK();
+
+  const int64_t out_size = params.out_h * params.out_w;
+  const int64_t spatial_total = params.N * out_size;
+  const size_t smem_bytes = static_cast<size_t>(params.C) * sizeof(T);
+  const size_t smem_limit = (max_smem_per_block > 0) ? max_smem_per_block : 16384;
+
+  if (params.offset_group == 1 && params.C <= kDeformConv1x1MaxSharedC && smem_bytes <= smem_limit) {
+    const int64_t m_blocks = (params.M + kDeformConv1x1OutputsPerBlock - 1) / kDeformConv1x1OutputsPerBlock;
+    const int64_t K_max_smem = static_cast<int64_t>(smem_limit / (params.C * sizeof(T)));
+    const int64_t K_positions = (params.C < 256)
+        ? std::min(std::max(static_cast<int64_t>(1), (256 + params.C - 1) / params.C), std::max(static_cast<int64_t>(1), K_max_smem))
+        : 1;
+    const size_t smem_k = static_cast<size_t>(K_positions) * params.C * sizeof(T);
+    const int64_t spatial_blocks = (spatial_total + K_positions - 1) / K_positions;
+    const size_t blocks_needed = static_cast<size_t>(spatial_blocks) * static_cast<size_t>(m_blocks);
+    if (blocks_needed <= static_cast<size_t>(std::numeric_limits<int>::max())) {
+      const int blocks = static_cast<int>(blocks_needed);
+      if (params.use_mask) {
+        FusedDeformConv1x1SharedKernel<T, true><<<blocks, kDeformConvThreadsPerBlock, smem_k, stream>>>(
+            input, offset, mask, weight, bias, output,
+            params.N, params.C, params.H, params.W_in, params.M,
+            params.out_h, params.out_w,
+            params.pad_h, params.pad_w, params.stride_h, params.stride_w,
+            params.group, K_positions);
+      } else {
+        FusedDeformConv1x1SharedKernel<T, false><<<blocks, kDeformConvThreadsPerBlock, smem_k, stream>>>(
+            input, offset, mask, weight, bias, output,
+            params.N, params.C, params.H, params.W_in, params.M,
+            params.out_h, params.out_w,
+            params.pad_h, params.pad_w, params.stride_h, params.stride_w,
+            params.group, K_positions);
+      }
+    } else {
+      int blocks = GetGridSize(static_cast<size_t>(total), kDeformConvThreadsPerBlock);
+      FusedDeformConv1x1Kernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
+        input, offset, mask, weight, bias, output,
+        params.N, params.C, params.H, params.W_in, params.M,
+        params.out_h, params.out_w,
+        params.pad_h, params.pad_w, params.stride_h, params.stride_w,
+        params.group, params.offset_group, params.use_mask);
+    }
+  } else {
+    int blocks = GetGridSize(static_cast<size_t>(total), kDeformConvThreadsPerBlock);
+    FusedDeformConv1x1Kernel<T><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
+        input, offset, mask, weight, bias, output,
+        params.N, params.C, params.H, params.W_in, params.M,
+        params.out_h, params.out_w,
+        params.pad_h, params.pad_w, params.stride_h, params.stride_w,
+        params.group, params.offset_group, params.use_mask);
+  }
   return CUDA_CALL(cudaGetLastError());
 }
 
@@ -435,14 +803,24 @@ Status DeformConvIm2ColImpl(
 }
 
 #define INST_DeformConvIm2ColImpl(T) \
-  template Status DeformConvIm2ColImpl<T>(cudaStream_t, const T*, const T*, const T*, T*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool);
+  template Status DeformConvIm2ColImpl<T>(cudaStream_t, const T*, const T*, const T*, T*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool)
 
-INST_DeformConvIm2ColImpl(float)
-    INST_DeformConvIm2ColImpl(double)
-        INST_DeformConvIm2ColImpl(half)
-            INST_DeformConvIm2ColImpl(BFloat16)
+INST_DeformConvIm2ColImpl(float);
+INST_DeformConvIm2ColImpl(double);
+INST_DeformConvIm2ColImpl(half);
+INST_DeformConvIm2ColImpl(BFloat16);
 
-                template Status DeformConvCopyGemmOutputRowMajorToNCHW<float>(cudaStream_t, const float*, float*, int64_t, int64_t, int64_t, int64_t);
+#define INST_DeformConvFused1x1Impl(T)                                                    \
+  template Status DeformConvFused1x1Impl<T>(cudaStream_t, const DeformConvParams&,        \
+                                           const T*, const T*, const T*, const T*,        \
+                                           const T*, T*, size_t)
+
+INST_DeformConvFused1x1Impl(float)
+INST_DeformConvFused1x1Impl(double)
+INST_DeformConvFused1x1Impl(half)
+INST_DeformConvFused1x1Impl(BFloat16)
+
+template Status DeformConvCopyGemmOutputRowMajorToNCHW<float>(cudaStream_t, const float*, float*, int64_t, int64_t, int64_t, int64_t);
 template Status DeformConvCopyGemmOutputRowMajorToNCHW<double>(cudaStream_t, const double*, double*, int64_t, int64_t, int64_t, int64_t);
 template Status DeformConvCopyGemmOutputRowMajorToNCHW<half>(cudaStream_t, const half*, half*, int64_t, int64_t, int64_t, int64_t);
 template Status DeformConvCopyGemmOutputRowMajorToNCHW<BFloat16>(cudaStream_t, const BFloat16*, BFloat16*, int64_t, int64_t, int64_t, int64_t);
@@ -454,6 +832,19 @@ template Status DeformConvAddBiasImpl<BFloat16>(cudaStream_t, BFloat16*, const B
 
 // Delegate ORT type to CUDA type (e.g. MLFloat16 -> half); avoids repeating three identical specializations.
 #define DELEGATE_DEFORM_CONV_IMPL(ORT_T, CUDA_T)                                                                    \
+  template <>                                                                                                       \
+  Status DeformConvFused1x1Impl<ORT_T>(cudaStream_t stream, const DeformConvParams& params,                        \
+                                        const ORT_T* input, const ORT_T* offset, const ORT_T* mask,               \
+                                        const ORT_T* weight, const ORT_T* bias, ORT_T* output,                    \
+                                        size_t max_smem_per_block) {                                                \
+    return DeformConvFused1x1Impl<CUDA_T>(stream, params,                                                           \
+                                          reinterpret_cast<const CUDA_T*>(input),                                   \
+                                          reinterpret_cast<const CUDA_T*>(offset),                                 \
+                                          mask ? reinterpret_cast<const CUDA_T*>(mask) : nullptr,                   \
+                                          reinterpret_cast<const CUDA_T*>(weight),                                  \
+                                          bias ? reinterpret_cast<const CUDA_T*>(bias) : nullptr,                   \
+                                          reinterpret_cast<CUDA_T*>(output), max_smem_per_block);                    \
+  }                                                                                                                 \
   template <>                                                                                                       \
   Status DeformConvIm2ColImpl<ORT_T>(cudaStream_t stream, const ORT_T* input,                                       \
                                      const ORT_T* offset, const ORT_T* mask, ORT_T* col_buffer,                     \

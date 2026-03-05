@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include "core/common/status.h"
+#include "core/providers/cpu/nn/deform_conv_attributes.h"
 
 namespace onnxruntime {
 namespace cuda {
@@ -32,6 +33,21 @@ Status DeformConvCopyGemmOutputRowMajorToNCHW(
     int64_t M_per_group,
     int64_t output_image_size,
     int64_t cur_parallel);
+
+// Fused 1x1 DeformConv: sample + matmul in one kernel. No col_buffer, no GEMM, no copy.
+// Use when kH==1 and kW==1 for maximum performance. Supports group and offset_group.
+// max_smem_per_block: from cudaDeviceGetAttribute(cudaDevAttrMaxSharedMemoryPerBlock).
+template <typename T>
+Status DeformConvFused1x1Impl(
+    cudaStream_t stream,
+    const DeformConvParams& params,
+    const T* input,
+    const T* offset,
+    const T* mask,
+    const T* weight,
+    const T* bias,
+    T* output,
+    size_t max_smem_per_block = 0);
 
 // Fills col_buffer with deformable im2col. col_buffer layout: row-major [C*kH*kW, parallel_imgs*out_h*out_w].
 // Called once per batch block; caller does GEMM and bias. T may be float, double, MLFloat16 (FP16), or BFloat16.
