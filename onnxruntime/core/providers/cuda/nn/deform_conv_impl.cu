@@ -154,7 +154,7 @@ __device__ __inline__ T BilinearInterpolate(
 }
 
 // kH/kW = -1 means dynamic (runtime); >= 0 means compile-time constant for loop unrolling.
-template <typename T, typename IndexT, bool UseMask, int kH = -1, int kW = -1>
+template <typename T, typename IndexT, bool UseMask, bool OffsetGroupOne, int kH = -1, int kW = -1>
 __global__ void DeformableIm2ColKernel(
     IndexT num_kernels,
     const T* __restrict__ input,
@@ -213,7 +213,7 @@ __global__ void DeformableIm2ColKernel(
 
     // [Optimization 3] Avoid expensive division if offset_group is 1 (very common case).
     IndexT offset_grp = 0;
-    if (offset_group > 1) {
+    if constexpr (!OffsetGroupOne) {
       IndexT dummy;
       channel_per_offset_grp_div.divmod(in_c, offset_grp, dummy);
     }
@@ -399,18 +399,19 @@ Status DeformConvIm2ColImpl(
 
   int blocks = GetGridSize(static_cast<size_t>(num_kernels), kDeformConvThreadsPerBlock);
 
-  auto launch = [&](auto kH_tag, auto kW_tag, auto use_mask_tag) {
+  auto launch = [&](auto kH_tag, auto kW_tag, auto use_mask_tag, auto offset_group_one_tag) {
     constexpr int KH = decltype(kH_tag)::value;
     constexpr int KW = decltype(kW_tag)::value;
     constexpr bool UseMask = decltype(use_mask_tag)::value;
+    constexpr bool OffsetGroupOne = decltype(offset_group_one_tag)::value;
     if (use_64bit) {
-      DeformableIm2ColKernel<T, int64_t, UseMask, KH, KW><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
+      DeformableIm2ColKernel<T, int64_t, UseMask, OffsetGroupOne, KH, KW><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
           num_kernels, input, offset, mask, H, W, kH, kW, pad_h, pad_w,
           stride_h, stride_w, dilation_h, dilation_w, C, offset_group,
           DivMod<int64_t>(out_h), DivMod<int64_t>(out_w), DivMod<int64_t>(parallel_imgs),
           DivMod<int64_t>(C / offset_group), col_buffer);
     } else {
-      DeformableIm2ColKernel<T, int32_t, UseMask, KH, KW><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
+      DeformableIm2ColKernel<T, int32_t, UseMask, OffsetGroupOne, KH, KW><<<blocks, kDeformConvThreadsPerBlock, 0, stream>>>(
           static_cast<int32_t>(num_kernels), input, offset, mask, H, W, kH, kW, pad_h, pad_w,
           stride_h, stride_w, dilation_h, dilation_w, C, offset_group,
           DivMod<int32_t>(static_cast<int32_t>(out_h)),
@@ -421,22 +422,30 @@ Status DeformConvIm2ColImpl(
     }
   };
 
-  auto launch_with_mask = [&](auto kH_tag, auto kW_tag) {
+  auto launch_dispatch = [&](auto kH_tag, auto kW_tag, bool allow_offset_group_one_specialization) {
+    const bool use_offset_group_one_specialization = allow_offset_group_one_specialization && (offset_group == 1);
+    auto launch_by_mask = [&](auto use_mask_tag) {
+      if (use_offset_group_one_specialization) {
+        launch(kH_tag, kW_tag, use_mask_tag, std::true_type{});
+      } else {
+        launch(kH_tag, kW_tag, use_mask_tag, std::false_type{});
+      }
+    };
     if (use_mask) {
-      launch(kH_tag, kW_tag, std::true_type{});
+      launch_by_mask(std::true_type{});
     } else {
-      launch(kH_tag, kW_tag, std::false_type{});
+      launch_by_mask(std::false_type{});
     }
   };
 
   if (kH == 1 && kW == 1) {
-    launch_with_mask(DeformConvKSize<1>{}, DeformConvKSize<1>{});
+    launch_dispatch(DeformConvKSize<1>{}, DeformConvKSize<1>{}, true);
   } else if (kH == 3 && kW == 3) {
-    launch_with_mask(DeformConvKSize<3>{}, DeformConvKSize<3>{});
+    launch_dispatch(DeformConvKSize<3>{}, DeformConvKSize<3>{}, true);
   } else if (kH == 5 && kW == 5) {
-    launch_with_mask(DeformConvKSize<5>{}, DeformConvKSize<5>{});
+    launch_dispatch(DeformConvKSize<5>{}, DeformConvKSize<5>{}, true);
   } else {
-    launch_with_mask(DeformConvKSize<-1>{}, DeformConvKSize<-1>{});
+    launch_dispatch(DeformConvKSize<-1>{}, DeformConvKSize<-1>{}, false);
   }
   return CUDA_CALL(cudaGetLastError());
 }
