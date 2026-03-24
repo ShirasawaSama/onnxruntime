@@ -291,11 +291,22 @@ __global__ void DeformableIm2ColKernel(
     };
 
     if constexpr (is_fixed) {
+      if constexpr (kH == 5 && kW == 5) {
+        // Partial unroll for 5x5 to reduce register pressure/code size.
 #pragma unroll
-      for (int i = 0; i < kH; ++i) {
+        for (int i = 0; i < kH; ++i) {
+#pragma unroll 1
+          for (int j = 0; j < kW; ++j) {
+            process_kernel_point(static_cast<IndexT>(i), static_cast<IndexT>(j));
+          }
+        }
+      } else {
 #pragma unroll
-        for (int j = 0; j < kW; ++j) {
-          process_kernel_point(static_cast<IndexT>(i), static_cast<IndexT>(j));
+        for (int i = 0; i < kH; ++i) {
+#pragma unroll
+          for (int j = 0; j < kW; ++j) {
+            process_kernel_point(static_cast<IndexT>(i), static_cast<IndexT>(j));
+          }
         }
       }
     } else {
