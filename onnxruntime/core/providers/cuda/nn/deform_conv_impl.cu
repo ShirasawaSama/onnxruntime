@@ -97,6 +97,12 @@ struct DeformConvBilinearTraits<BFloat16> {
   }
 };
 
+template <typename T>
+__device__ __forceinline__ int DeformConvFastFloor(T x) {
+  const int i = static_cast<int>(x);
+  return i - static_cast<int>(i > x);
+}
+
 // Bilinear interpolation at (h, w). Returns 0 if out of bounds (ONNX spec).
 // Indices h_low, w_low, h_high, w_high use int (not int64_t) to reduce register pressure and
 // improve occupancy in the hot path. Limitation: (H+1)*W must not exceed INT_MAX; this is
@@ -115,16 +121,20 @@ __device__ __inline__ T BilinearInterpolate(
   using Traits = DeformConvBilinearTraits<T>;
   using CoordT = typename Traits::ComputeT;
 
-  // [Optimization 1]: Early exit for clearly out-of-bounds (skip floor() for OOB case).
-  if (h <= static_cast<CoordT>(-1) || h >= height || w <= static_cast<CoordT>(-1) || w >= width) {
+  const CoordT neg1 = static_cast<CoordT>(-1);
+  const CoordT h_max = static_cast<CoordT>(height);
+  const CoordT w_max = static_cast<CoordT>(width);
+  const unsigned in_bounds = static_cast<unsigned>(
+      (h > neg1) & (h < h_max) & (w > neg1) & (w < w_max));
+  if (in_bounds == 0u) {
     return Traits::Zero();
   }
 
-  // [Optimization 2]: Keep floor result in T; cast to int only for indices. Avoids float->int->float in lh/lw.
-  CoordT h_floor = _Floor(h);
-  CoordT w_floor = _Floor(w);
-  int h_low = static_cast<int>(h_floor);
-  int w_low = static_cast<int>(w_floor);
+  // Use truncation + correction to avoid extra floor conversion instructions.
+  const int h_low = DeformConvFastFloor(h);
+  const int w_low = DeformConvFastFloor(w);
+  const CoordT h_floor = static_cast<CoordT>(h_low);
+  const CoordT w_floor = static_cast<CoordT>(w_low);
   int h_high = h_low + 1;
   int w_high = w_low + 1;
 
